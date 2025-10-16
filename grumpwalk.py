@@ -2008,6 +2008,13 @@ async def find_duplicates(
     hash_groups = defaultdict(list)
     BATCH_SIZE = 1000  # Process files in batches to avoid overwhelming the system
 
+    # Track progress across all groups
+    total_files_to_hash = sum(len(group) for group in potential_duplicates.values())
+    files_hashed = 0
+    hash_start_time = time.time()
+    last_progress_update = time.time()
+    is_tty = sys.stderr.isatty() if progress else False
+
     async with client.create_session() as session:
         for fingerprint, group in potential_duplicates.items():
             # Extract size from fingerprint
@@ -2035,10 +2042,36 @@ async def find_duplicates(
                         combined_fingerprint = f"{fingerprint}:{sample_hash}"
                         hash_groups[combined_fingerprint].append(entry)
 
-                if progress and progress.verbose:
-                    hashed_count = i + len(batch)
-                    total_in_group = len(group)
-                    print(f"[DUPLICATE DETECTION] Hashed {hashed_count:,} / {total_in_group:,} files in group", file=sys.stderr)
+                # Update progress
+                files_hashed += len(batch)
+
+                if progress:
+                    current_time = time.time()
+                    elapsed = current_time - hash_start_time
+                    rate = files_hashed / elapsed if elapsed > 0 else 0
+                    remaining = total_files_to_hash - files_hashed
+
+                    progress_msg = (f"[DUPLICATE DETECTION] {files_hashed:,} / {total_files_to_hash:,} hashed | "
+                                  f"{remaining:,} remaining | {rate:.1f} files/sec")
+
+                    # Only update progress display every 0.5 seconds
+                    if is_tty:
+                        # Always overwrite in TTY mode
+                        print(f"\r{progress_msg}", end='', file=sys.stderr, flush=True)
+                    elif progress.verbose and (current_time - last_progress_update) > 0.5:
+                        # Only print on new line when redirected AND enough time has passed
+                        print(progress_msg, file=sys.stderr, flush=True)
+                        last_progress_update = current_time
+
+    # Print final summary
+    if progress and is_tty:
+        elapsed = time.time() - hash_start_time
+        rate = files_hashed / elapsed if elapsed > 0 else 0
+        print(f"\r[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
+    elif progress and progress.verbose:
+        elapsed = time.time() - hash_start_time
+        rate = files_hashed / elapsed if elapsed > 0 else 0
+        print(f"[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
 
     # Filter to only groups with 2+ files (actual duplicates)
     duplicates = {k: v for k, v in hash_groups.items() if len(v) >= 2}
