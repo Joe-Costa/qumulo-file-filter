@@ -2008,12 +2008,28 @@ async def find_duplicates(
     hash_groups = defaultdict(list)
     BATCH_SIZE = 1000  # Process files in batches to avoid overwhelming the system
 
+    # Limit concurrent hash operations to avoid overwhelming connection pool
+    # Each hash operation does N API calls (where N = sample points)
+    # Connection pool size is ~100, so we want: concurrent_hashes * sample_points ≤ 80
+    # This leaves some headroom for other operations
+    # Calculate based on actual sample_points being used
+    avg_sample_points = sample_points if sample_points else 7  # Default adaptive is ~7
+    MAX_CONCURRENT_HASHES = max(10, min(80, 80 // avg_sample_points))
+
     # Track progress across all groups
     total_files_to_hash = sum(len(group) for group in potential_duplicates.values())
     files_hashed = 0
     hash_start_time = time.time()
     last_progress_update = time.time()
     is_tty = sys.stderr.isatty() if progress else False
+
+    # Create semaphore to limit concurrent hash operations
+    hash_semaphore = asyncio.Semaphore(MAX_CONCURRENT_HASHES)
+
+    async def hash_with_limit(entry, file_path, file_size, sample_points):
+        """Wrapper to limit concurrent hash operations."""
+        async with hash_semaphore:
+            return await compute_sample_hash(client, session, file_path, file_size, sample_points)
 
     async with client.create_session() as session:
         for fingerprint, group in potential_duplicates.items():
@@ -2025,11 +2041,11 @@ async def find_duplicates(
             for i in range(0, len(group), BATCH_SIZE):
                 batch = group[i:i + BATCH_SIZE]
 
-                # Compute hashes for this batch concurrently
+                # Compute hashes for this batch with concurrency limit
                 tasks = []
                 for entry in batch:
                     file_path = entry['path']
-                    task = compute_sample_hash(client, session, file_path, file_size, sample_points)
+                    task = hash_with_limit(entry, file_path, file_size, sample_points)
                     tasks.append((entry, task))
 
                 # Wait for all hashes in this batch to complete
@@ -2969,6 +2985,14 @@ async def main_async(args):
         # Report results
         if not duplicates:
             print("\nNo duplicates found.", file=sys.stderr)
+            # No duplicates, but may still need to create empty CSV
+            if args.csv_out:
+                import csv
+                with open(args.csv_out, "w", newline="") as csv_file:
+                    writer = csv.DictWriter(csv_file, fieldnames=["duplicate_group", "path", "size", "confidence"])
+                    writer.writeheader()
+                if args.verbose:
+                    print(f"\n[INFO] Created empty CSV file: {args.csv_out}", file=sys.stderr)
         else:
             total_groups = len(duplicates)
             total_dupes = sum(len(group) for group in duplicates.values())
@@ -2976,6 +3000,7 @@ async def main_async(args):
             # Calculate confidence based on detection method
             if args.by_size:
                 confidence_msg = "Detection method: Size+metadata only (may have false positives)"
+                confidence_value = "Low (size+metadata only)"
             else:
                 # Get sample point count from first group (representative)
                 first_file = next(iter(duplicates.values()))[0]
@@ -2984,21 +3009,46 @@ async def main_async(args):
                 num_points = len(sample_offsets)
                 confidence = calculate_confidence_percentage(num_points)
                 confidence_msg = f"Detection method: {num_points}-point sampling (confidence: {confidence})"
+                confidence_value = confidence
 
             print(f"\nFound {total_dupes:,} duplicate files in {total_groups:,} groups", file=sys.stderr)
             print(f"{confidence_msg}", file=sys.stderr)
             print(f"{'=' * 70}\n", file=sys.stderr)
 
-            # Output duplicate groups
-            for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
-                # Extract size from fingerprint
-                size_str = fingerprint.split(':')[0]
-                file_size = int(size_str)
+            # Handle CSV output for duplicates
+            if args.csv_out:
+                import csv
+                with open(args.csv_out, "w", newline="") as csv_file:
+                    fieldnames = ["duplicate_group", "path", "size", "confidence"]
+                    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                    writer.writeheader()
 
-                print(f"Group {group_id}: {len(files)} files ({file_size:,} bytes each)", file=sys.stderr)
-                for f in files:
-                    print(f"  {f['path']}", file=sys.stderr)
-                print(file=sys.stderr)
+                    for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                        # Extract size from fingerprint
+                        size_str = fingerprint.split(':')[0]
+                        file_size = int(size_str)
+
+                        for f in files:
+                            writer.writerow({
+                                "duplicate_group": group_id,
+                                "path": f['path'],
+                                "size": file_size,
+                                "confidence": confidence_value
+                            })
+
+                if args.verbose:
+                    print(f"\n[INFO] Wrote {total_dupes:,} duplicate files ({total_groups:,} groups) to {args.csv_out}", file=sys.stderr)
+            else:
+                # Output duplicate groups to stdout/stderr (original behavior)
+                for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                    # Extract size from fingerprint
+                    size_str = fingerprint.split(':')[0]
+                    file_size = int(size_str)
+
+                    print(f"Group {group_id}: {len(files)} files ({file_size:,} bytes each)", file=sys.stderr)
+                    for f in files:
+                        print(f"  {f['path']}", file=sys.stderr)
+                    print(file=sys.stderr)
 
         if profiler:
             profiler.print_report(elapsed)
