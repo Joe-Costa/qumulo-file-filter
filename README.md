@@ -16,6 +16,7 @@ High-performance async file search tool for Qumulo storage systems.
 - **Directory scope preview** - Shows total subdirs/files before search
 - **Owner reports** - Generate storage capacity breakdowns by owner
 - **Permissions reports** - Retrieve permissions ACLs of objects in tree
+- **Duplicate detection** - Find duplicate files using adaptive sampling (advisory only)
 
 ## Requirements
 
@@ -23,6 +24,7 @@ High-performance async file search tool for Qumulo storage systems.
 - `aiohttp` - Install with: `pip install aiohttp`
 - `qumulo_api` - Install with: `pip install qumulo_api`
 - `ujson` (optional) - For faster JSON parsing: `pip install ujson`
+- `xxhash` (optional) - For 10x faster duplicate detection: `pip install xxhash`
 - Qumulo cluster credentials (use `qq login`)
 
 ## Installation
@@ -114,6 +116,27 @@ pip install -r requirements.txt
 - ACLs are returned in NFSv4 shorthand for brevity and compactness (`rwaxdDtTnNcCoy`).
 - These rights map directly to the 14 NTFS rights in an ACE
 - Refer to [The nfs4_acl man page](https://www.man7.org/linux//man-pages/man5/nfs4_acl.5.html) for details
+
+### Duplicate Detection Options
+- `--find-duplicates` - Find duplicate files (ADVISORY ONLY - verify before deletion)
+- `--by-size` - Use size-only detection (fast, may have false positives)
+- `--sample-points N` - Override adaptive sample count (default: 3-11 based on file size)
+
+**How it works:**
+1. Groups files by size and data blocks (metadata fingerprint)
+2. For each group, computes content hash of samples in parallel
+3. Uses adaptive sampling strategy:
+   - Sample count: 3-11 points based on file size
+   - Sample size: 64KB-1MB per sample based on file size
+   - Coverage: ~0.5-1% of file content
+   - Hash algorithm: xxHash3 (if installed, 10-20x faster) or BLAKE2b (fallback, 2-3x faster than SHA-256)
+4. Reports files with matching fingerprints
+
+**Limitations:**
+- Uses sampling, not full file hashing
+- May miss small differences in large files
+- Results are advisory only - always verify before deletion
+- Not suitable as sole basis for data deduplication
 
 ### Output Options
 - `--json` - JSON output to stdout
@@ -223,6 +246,18 @@ pip install -r requirements.txt
 ./grumpwalk.py --host cluster.example.com --path /shared \
   --acl-report --acl-csv permissions.csv \
   --acl-resolve-names --show-owner --show-group --progress
+```
+
+### Find duplicate files (content-based sampling)
+```bash
+./grumpwalk.py --host cluster.example.com --path /data \
+  --find-duplicates --progress --csv-out duplicates.csv
+```
+
+### Find duplicates by size only (fast, advisory)
+```bash
+./grumpwalk.py --host cluster.example.com --path /backups \
+  --find-duplicates --by-size --larger-than 100MB --progress
 ```
 
 ## Performance Tips

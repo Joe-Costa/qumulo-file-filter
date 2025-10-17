@@ -20,73 +20,26 @@ Key improvements over bash version:
 import argparse
 import asyncio
 import fnmatch
-import hashlib
 import json
-import os
 import re
 import ssl
 import sys
 import time
-
-# Try to import xxhash for faster hashing (optional, 10-20x faster than SHA-256)
-try:
-    import xxhash
-    HAS_XXHASH = True
-except ImportError:
-    HAS_XXHASH = False
 from pathlib import Path
 from typing import List, Optional, Dict, Set
 from urllib.parse import quote, urlparse, parse_qs
 from datetime import datetime, timedelta, timezone
 
-# Standalone credential management (no cli/cli/ dependencies)
-CREDENTIALS_FILENAME = '.qfsd_cred'
-CREDENTIALS_VERSION = 1
+# Add the Qumulo CLI directory to path to import auth modules
+CLI_PATH = Path(__file__).parent / "cli" / "cli"
+sys.path.insert(0, str(CLI_PATH))
 
-
-def credential_store_filename(creds_file_name: str = CREDENTIALS_FILENAME) -> str:
-    """Get the path to the credentials store file."""
-    if os.path.isabs(creds_file_name):
-        return creds_file_name
-
-    home = os.path.expanduser('~')
-    if home == '~':
-        home = os.environ.get('HOME')
-
-    if home is None or home == '~':
-        raise OSError('Could not find home directory for credentials store')
-
-    path = os.path.join(home, creds_file_name)
-    if os.path.isdir(path):
-        raise OSError('Credentials store is a directory: %s' % path)
-    return path
-
-
-def get_credentials(path: str) -> Optional[str]:
-    """
-    Load credentials from file and return bearer token.
-    Returns None if file doesn't exist or is empty.
-    """
-    if not os.path.isfile(path):
-        return None
-
-    try:
-        with open(path) as store:
-            if os.fstat(store.fileno()).st_size == 0:
-                return None
-            contents = json.load(store)
-
-        # Extract bearer_token from the credentials file
-        if 'bearer_token' not in contents:
-            return None
-
-        bearer_token = contents['bearer_token']
-        if not isinstance(bearer_token, str):
-            return None
-
-        return bearer_token
-    except (json.JSONDecodeError, OSError, KeyError):
-        return None
+try:
+    from qumulo.lib.auth import get_credentials, credential_store_filename
+except ImportError as e:
+    print(f"[ERROR] Failed to import Qumulo API modules: {e}", file=sys.stderr)
+    print(f"[ERROR] Make sure the CLI directory exists at: {CLI_PATH}", file=sys.stderr)
+    sys.exit(1)
 
 try:
     import aiohttp
@@ -110,6 +63,7 @@ except ImportError:
 # Identity cache configuration
 IDENTITY_CACHE_FILE = "file_filter_resolved_identities"
 IDENTITY_CACHE_TTL = 15 * 60  # 15 minutes in seconds
+import os
 
 
 def load_identity_cache(verbose: bool = False) -> Dict:
@@ -296,20 +250,18 @@ class ProgressTracker:
 
 
 class BatchedOutputHandler:
-    """Handle batched output with identity resolution for --show-owner and --show-group streaming."""
+    """Handle batched output with identity resolution for --show-owner streaming."""
 
     def __init__(
         self,
         client: "AsyncQumuloClient",
         batch_size: int = 100,
         show_owner: bool = False,
-        show_group: bool = False,
         output_format: str = "text",
     ):
         self.client = client
         self.batch_size = batch_size
         self.show_owner = show_owner
-        self.show_group = show_group
         self.output_format = output_format  # 'text' or 'json'
         self.batch = []
         self.lock = asyncio.Lock()
@@ -329,29 +281,21 @@ class BatchedOutputHandler:
 
         identity_cache = {}
 
-        # Collect unique auth_ids (owners and/or groups) from batch
-        unique_auth_ids = set()
-
         if self.show_owner:
+            # Collect unique owner auth_ids from batch
+            unique_owners = set()
             for entry in self.batch:
                 owner_details = entry.get("owner_details", {})
                 owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
                 if owner_auth_id:
-                    unique_auth_ids.add(owner_auth_id)
+                    unique_owners.add(owner_auth_id)
 
-        if self.show_group:
-            for entry in self.batch:
-                group_details = entry.get("group_details", {})
-                group_auth_id = group_details.get("auth_id") or entry.get("group")
-                if group_auth_id:
-                    unique_auth_ids.add(group_auth_id)
-
-        # Resolve all identities in parallel
-        if unique_auth_ids:
-            async with self.client.create_session() as session:
-                identity_cache = await self.client.resolve_multiple_identities(
-                    session, list(unique_auth_ids)
-                )
+            # Resolve all owners in parallel
+            if unique_owners:
+                async with self.client.create_session() as session:
+                    identity_cache = await self.client.resolve_multiple_identities(
+                        session, list(unique_owners)
+                    )
 
         # Output batch
         for entry in self.batch:
@@ -360,7 +304,6 @@ class BatchedOutputHandler:
             else:
                 # Plain text
                 output_line = entry["path"]
-
                 if self.show_owner:
                     owner_details = entry.get("owner_details", {})
                     owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
@@ -370,17 +313,6 @@ class BatchedOutputHandler:
                         output_line = f"{output_line}\t{owner_name}"
                     else:
                         output_line = f"{output_line}\tUnknown"
-
-                if self.show_group:
-                    group_details = entry.get("group_details", {})
-                    group_auth_id = group_details.get("auth_id") or entry.get("group")
-                    if group_auth_id and group_auth_id in identity_cache:
-                        identity = identity_cache[group_auth_id]
-                        group_name = format_owner_name(identity)
-                        output_line = f"{output_line}\t{group_name}"
-                    else:
-                        output_line = f"{output_line}\tUnknown"
-
                 print(output_line)
             sys.stdout.flush()
 
@@ -467,42 +399,6 @@ class Profiler:
             print(f"  {i+1}. {operation}: {pct:.1f}% of total time", file=sys.stderr)
 
         print("=" * 80, file=sys.stderr)
-
-
-def format_http_error(status: int, url: str, path: Optional[str] = None) -> str:
-    """Format HTTP error with helpful context and suggestions."""
-    error_messages = {
-        401: (
-            "Authentication failed (401 Unauthorized)",
-            "Your credentials may have expired. Please run: qq --host <cluster> login"
-        ),
-        403: (
-            "Access denied (403 Forbidden)",
-            f"You don't have permission to access: {path or url}"
-        ),
-        404: (
-            "Not found (404)",
-            f"Path does not exist: {path or url}"
-        ),
-        429: (
-            "Too many requests (429)",
-            "The cluster is rate-limiting requests. Try reducing --max-concurrent"
-        ),
-        500: (
-            "Internal server error (500)",
-            "The cluster encountered an error. Contact Qumulo support if this persists"
-        ),
-        503: (
-            "Service unavailable (503)",
-            "The cluster is temporarily unavailable. Please try again later"
-        )
-    }
-
-    if status in error_messages:
-        title, suggestion = error_messages[status]
-        return f"\n[ERROR] {title}\n[HINT] {suggestion}"
-    else:
-        return f"\n[ERROR] HTTP {status}: {url}"
 
 
 def extract_pagination_token(api_response: dict) -> Optional[str]:
@@ -768,43 +664,6 @@ class AsyncQumuloClient:
                 # Fall back gracefully if capacity API unavailable
                 return {}
 
-    async def get_file_acl(
-        self, session: aiohttp.ClientSession, path: str
-    ) -> Optional[dict]:
-        """
-        Get the Access Control List (ACL) for a file or directory.
-
-        Args:
-            session: aiohttp ClientSession
-            path: File or directory path
-
-        Returns:
-            Dictionary containing ACL data with 'aces', 'control', 'posix_special_permissions',
-            or None if the ACL cannot be retrieved.
-        """
-        async with self.semaphore:
-            if not path.startswith("/"):
-                path = "/" + path
-
-            encoded_path = quote(path, safe="")
-            url = f"{self.base_url}/v1/files/{encoded_path}/info/acl"
-
-            try:
-                async with session.get(url, ssl=self.ssl_context) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        if self.verbose:
-                            print(
-                                f"[WARN] Failed to get ACL for {path}: HTTP {response.status}",
-                                file=sys.stderr,
-                            )
-                        return None
-            except aiohttp.ClientError as e:
-                if self.verbose:
-                    print(f"[WARN] Error getting ACL for {path}: {e}", file=sys.stderr)
-                return None
-
     async def read_symlink(self, session: aiohttp.ClientSession, path: str) -> Optional[str]:
         """
         Read the target of a symlink.
@@ -842,10 +701,7 @@ class AsyncQumuloClient:
         length: int
     ) -> Optional[bytes]:
         """
-        Read a specific byte range from a file.
-
-        Used for duplicate detection sampling - reads small chunks at specific
-        offsets without downloading the entire file.
+        Read a chunk of a file at a specific offset.
 
         Args:
             session: aiohttp ClientSession
@@ -861,29 +717,20 @@ class AsyncQumuloClient:
                 path = '/' + path
 
             encoded_path = quote(path, safe='')
-            url = f"{self.base_url}/v1/files/{encoded_path}/data"
-
-            # Use HTTP Range header to request specific bytes
-            headers = {'Range': f'bytes={offset}-{offset + length - 1}'}
+            url = f"{self.base_url}/v1/files/{encoded_path}/data?offset={offset}&length={length}"
 
             try:
-                async with session.get(url, headers=headers, ssl=self.ssl_context) as response:
-                    if response.status in (200, 206):  # 200 = full file, 206 = partial content
-                        # Read only the requested number of bytes from the stream
-                        # This efficiently handles servers that ignore Range headers
-                        chunks = []
-                        bytes_read = 0
-                        async for chunk in response.content.iter_chunked(min(length, 8192)):
-                            chunks.append(chunk)
-                            bytes_read += len(chunk)
-                            if bytes_read >= length:
-                                break
-
-                        data = b''.join(chunks)
-                        return data[:length]  # Ensure exact length
+                async with session.get(url, ssl=self.ssl_context) as response:
+                    if response.status == 200:
+                        data = await response.read()
+                        return data
                     else:
+                        if self.verbose:
+                            print(f"[WARN] Failed to read chunk from {path} at offset {offset}: HTTP {response.status}", file=sys.stderr)
                         return None
-            except aiohttp.ClientError:
+            except aiohttp.ClientError as e:
+                if self.verbose:
+                    print(f"[WARN] Error reading chunk from {path}: {e}", file=sys.stderr)
                 return None
 
     def calculate_adaptive_concurrency(self, total_entries: int) -> int:
@@ -1071,7 +918,6 @@ class AsyncQumuloClient:
         file_filter=None,
         owner_stats: Optional[OwnerStats] = None,
         omit_subdirs: Optional[List[str]] = None,
-        omit_paths: Optional[List[str]] = None,
         collect_results: bool = True,
         verbose: bool = False,
         max_entries_per_dir: Optional[int] = None,
@@ -1092,7 +938,6 @@ class AsyncQumuloClient:
             file_filter: Optional function to filter files
             owner_stats: Optional OwnerStats for collecting ownership data
             omit_subdirs: Optional list of wildcard patterns for directories to skip
-            omit_paths: Optional list of exact absolute paths to skip (no wildcards)
             collect_results: If False, don't accumulate matching entries (saves memory for reports)
             verbose: If True, emit warnings to stderr for large directories
             max_entries_per_dir: If set, skip directories with more entries than this limit
@@ -1309,9 +1154,6 @@ class AsyncQumuloClient:
         # Filter subdirectories based on omit patterns
         if omit_subdirs:
             filtered_subdirs = []
-            filtered_entries = []
-            omitted_dirs_count = 0
-
             for subdir_path in subdirs:
                 # Extract directory name (last component, handling trailing slashes)
                 subdir_name = (
@@ -1324,95 +1166,20 @@ class AsyncQumuloClient:
                 should_omit = False
                 matched_pattern = None
                 for pattern in omit_subdirs:
-                    # Normalize pattern by stripping trailing slashes for matching
-                    normalized_pattern = pattern.rstrip("/")
-
-                    # Try matching against:
-                    # 1. Full path (e.g., "/home/bob" matches "/home/bob")
-                    # 2. Directory name only (e.g., "bob" matches "bob")
-                    # 3. Pattern with wildcards (e.g., "bob*" matches "bob123")
-                    if (fnmatch.fnmatch(subdir_path.rstrip("/"), normalized_pattern) or
-                        fnmatch.fnmatch(subdir_name, normalized_pattern)):
+                    if fnmatch.fnmatch(subdir_name, pattern):
                         should_omit = True
                         matched_pattern = pattern
                         break
 
                 if should_omit:
-                    omitted_dirs_count += 1
+                    # if verbose:
+                    #     print(f"\r[SKIP] Omitting subdirectory: {subdir_path} (matched pattern: {matched_pattern})",
+                    #           file=sys.stderr)
+                    pass
                 else:
                     filtered_subdirs.append(subdir_path)
 
             subdirs = filtered_subdirs
-
-            # Report omitted directories to progress tracker
-            if progress and omitted_dirs_count > 0:
-                # We count each omitted directory as 1 subdirectory skipped
-                # We don't have file counts for omitted dirs without fetching their aggregates,
-                # so we report 0 files (the subdirs count is what matters here)
-                await progress.increment_skipped(0, omitted_dirs_count)
-
-            # Also filter matching_entries to remove directories that match omit patterns
-            for entry in matching_entries:
-                entry_path = entry.get('path', '')
-                entry_type = entry.get('type', '')
-
-                # Only filter directories
-                if entry_type == 'FS_FILE_TYPE_DIRECTORY':
-                    entry_name = (
-                        entry_path.rstrip("/").split("/")[-1]
-                        if "/" in entry_path
-                        else entry_path
-                    )
-
-                    should_omit = False
-                    for pattern in omit_subdirs:
-                        normalized_pattern = pattern.rstrip("/")
-                        if (fnmatch.fnmatch(entry_path.rstrip("/"), normalized_pattern) or
-                            fnmatch.fnmatch(entry_name, normalized_pattern)):
-                            should_omit = True
-                            break
-
-                    if not should_omit:
-                        filtered_entries.append(entry)
-                else:
-                    # Keep all files
-                    filtered_entries.append(entry)
-
-            matching_entries = filtered_entries
-
-        # Filter based on exact absolute paths (--omit-path)
-        if omit_paths:
-            filtered_subdirs = []
-            filtered_entries = []
-            omitted_paths_count = 0
-
-            # Normalize omit_paths by stripping trailing slashes for consistent matching
-            normalized_omit_paths = [p.rstrip("/") for p in omit_paths]
-
-            # Filter subdirectories
-            for subdir_path in subdirs:
-                normalized_subdir = subdir_path.rstrip("/")
-                if normalized_subdir in normalized_omit_paths:
-                    omitted_paths_count += 1
-                else:
-                    filtered_subdirs.append(subdir_path)
-
-            subdirs = filtered_subdirs
-
-            # Report omitted paths to progress tracker
-            if progress and omitted_paths_count > 0:
-                await progress.increment_skipped(0, omitted_paths_count)
-
-            # Also filter matching_entries to remove paths that match
-            for entry in matching_entries:
-                entry_path = entry.get('path', '')
-                normalized_entry_path = entry_path.rstrip("/")
-
-                # Check if this path should be omitted
-                if normalized_entry_path not in normalized_omit_paths:
-                    filtered_entries.append(entry)
-
-            matching_entries = filtered_entries
 
         # Output matches immediately if callback provided
         if output_callback and matching_entries:
@@ -1481,7 +1248,6 @@ class AsyncQumuloClient:
                         file_filter,
                         owner_stats,
                         omit_subdirs,
-                        omit_paths,
                         collect_results,
                         verbose,
                         max_entries_per_dir,
@@ -1957,1493 +1723,6 @@ class AsyncQumuloClient:
             return [auth_id]
 
 
-# ============================================================================
-# ACL Conversion Functions (QACL to NFSv4-style shorthand)
-# ============================================================================
-
-
-def qacl_flags_to_nfsv4(flags: List[str]) -> str:
-    """
-    Convert Qumulo ACE flags to NFSv4-style flag string.
-
-    Args:
-        flags: List of Qumulo flags (e.g., ['OBJECT_INHERIT', 'CONTAINER_INHERIT', 'INHERITED'])
-
-    Returns:
-        NFSv4 flags string (e.g., 'fdI')
-    """
-    mapping = {
-        'OBJECT_INHERIT': 'f',
-        'CONTAINER_INHERIT': 'd',
-        'NO_PROPAGATE_INHERIT': 'n',
-        'INHERIT_ONLY': 'i',
-        'INHERITED': 'I'
-    }
-
-    nfsv4_flags = []
-    for flag in flags:
-        if flag in mapping:
-            nfsv4_flags.append(mapping[flag])
-
-    return ''.join(nfsv4_flags)
-
-
-def qacl_rights_to_nfsv4(rights: List[str], is_directory: bool = False) -> str:
-    """
-    Convert Qumulo QACL rights to NFSv4 permission string.
-
-    Args:
-        rights: List of Qumulo rights (e.g., ['READ', 'WRITE_ATTR', 'EXECUTE'])
-        is_directory: Whether the file is a directory (affects DELETE_CHILD)
-
-    Returns:
-        NFSv4 permission string (e.g., 'rxtncy')
-    """
-    mapping = {
-        'READ': 'r',
-        'MODIFY': 'w',
-        'EXTEND': 'a',
-        'EXECUTE': 'x',
-        'DELETE': 'd',
-        'DELETE_CHILD': 'D',  # Only valid for directories
-        'READ_ATTR': 't',
-        'WRITE_ATTR': 'T',
-        'READ_EA': 'n',
-        'WRITE_EA': 'N',
-        'READ_ACL': 'c',
-        'WRITE_ACL': 'C',
-        'CHANGE_OWNER': 'o',
-        'SYNCHRONIZE': 'y'
-    }
-
-    perms = []
-    for right in rights:
-        if right in mapping:
-            # Skip DELETE_CHILD if not a directory
-            if right == 'DELETE_CHILD' and not is_directory:
-                continue
-            perms.append(mapping[right])
-
-    # Return in canonical order: rwaxdDtTnNcCoy
-    canonical_order = 'rwaxdDtTnNcCoy'
-    return ''.join(p for p in canonical_order if p in perms)
-
-
-def qacl_trustee_to_nfsv4(trustee: Dict, trustee_details: Optional[Dict] = None) -> str:
-    """
-    Convert Qumulo trustee to NFSv4-style principal format.
-
-    Args:
-        trustee: Qumulo trustee dict or auth_id string
-        trustee_details: Optional trustee_details dict with id_type and id_value
-
-    Returns:
-        NFSv4 principal string (e.g., 'EVERYONE@', 'uid:1001', 'alice@corp.com')
-    """
-    # Handle legacy format (dict with domain, uid, gid, etc.)
-    if isinstance(trustee, dict):
-        domain = trustee.get('domain')
-        uid = trustee.get('uid')
-        gid = trustee.get('gid')
-        name = trustee.get('name')
-
-        if domain == 'WORLD':
-            return 'EVERYONE@'
-        elif domain == 'POSIX_USER':
-            return f'uid:{uid}' if uid is not None else 'OWNER@'
-        elif domain == 'POSIX_GROUP':
-            return f'gid:{gid}' if gid is not None else 'GROUP@'
-        elif domain == 'LOCAL_USER':
-            return f'user:{name}' if name else f'uid:{uid}'
-        elif domain == 'LOCAL_GROUP':
-            return f'group:{name}' if name else f'gid:{gid}'
-        elif domain in ('AD_USER', 'AD_GROUP'):
-            return name if name else f'sid:{trustee.get("sid")}'
-        else:
-            return f'unknown:{trustee.get("auth_id")}'
-
-    # Handle current API format (trustee is auth_id string, details in trustee_details)
-    if trustee_details:
-        id_type = trustee_details.get('id_type')
-        id_value = trustee_details.get('id_value')
-
-        if id_type == 'NFS_UID':
-            return f'uid:{id_value}'
-        elif id_type == 'NFS_GID':
-            return f'gid:{id_value}'
-        elif id_type == 'SMB_SID':
-            # Check for well-known SIDs
-            if id_value == 'S-1-1-0':
-                return 'EVERYONE@'
-            return f'sid:{id_value}'
-        elif id_type == 'LOCAL_USER':
-            return f'user:{id_value}'
-        elif id_type == 'LOCAL_GROUP':
-            return f'group:{id_value}'
-
-    # Fallback: use auth_id
-    return f'auth_id:{trustee}'
-
-
-def extract_auth_ids_from_acl(qacl_data: Dict) -> set:
-    """
-    Extract all unique auth_ids from an ACL for identity resolution.
-
-    Args:
-        qacl_data: Full QACL dict
-
-    Returns:
-        Set of auth_id strings found in the ACL
-    """
-    auth_ids = set()
-
-    if not qacl_data:
-        return auth_ids
-
-    # Handle nested structure
-    if 'acl' in qacl_data and 'aces' not in qacl_data:
-        qacl_data = qacl_data['acl']
-
-    for ace in qacl_data.get('aces', []):
-        trustee = ace.get('trustee')
-
-        # Current API format: trustee is auth_id string
-        if isinstance(trustee, str):
-            auth_ids.add(trustee)
-        # Legacy format: trustee is dict with auth_id
-        elif isinstance(trustee, dict) and 'auth_id' in trustee:
-            auth_ids.add(trustee['auth_id'])
-
-    return auth_ids
-
-
-def qacl_trustee_to_readable_name(trustee: Dict, trustee_details: Optional[Dict], identity_cache: Dict) -> str:
-    """
-    Convert Qumulo trustee to human-readable name using identity cache.
-    Falls back to technical format if name not available.
-
-    Args:
-        trustee: Trustee value (auth_id string or dict)
-        trustee_details: Trustee details dict
-        identity_cache: Dictionary mapping auth_id to resolved identity info
-
-    Returns:
-        Human-readable trustee name or fallback technical format
-    """
-    # Get auth_id
-    auth_id = None
-    if isinstance(trustee, str):
-        auth_id = trustee
-    elif isinstance(trustee, dict):
-        auth_id = trustee.get('auth_id')
-
-    # Try to resolve from cache
-    if auth_id and auth_id in identity_cache:
-        identity = identity_cache[auth_id]
-        name = identity.get('name', '')
-        domain = identity.get('domain', '')
-
-        # Format based on domain
-        if domain == 'WORLD':
-            return 'EVERYONE@'
-        elif domain == 'POSIX_USER':
-            uid = identity.get('uid')
-            if name and not name.startswith('Unknown'):
-                return f'{name} (UID {uid})' if uid else name
-            return f'UID {uid}' if uid else 'OWNER@'
-        elif domain == 'POSIX_GROUP':
-            gid = identity.get('gid')
-            if name and not name.startswith('Unknown'):
-                return f'{name} (GID {gid})' if gid else name
-            return f'GID {gid}' if gid else 'GROUP@'
-        elif domain in ('ACTIVE_DIRECTORY', 'AD_USER', 'AD_GROUP'):
-            return name if name else f'SID {identity.get("sid", auth_id)}'
-        elif domain in ('LOCAL', 'LOCAL_USER', 'LOCAL_GROUP'):
-            return name if name else f'Local {auth_id}'
-        elif name:
-            return name
-
-    # Fallback to technical format
-    return qacl_trustee_to_nfsv4(trustee, trustee_details)
-
-
-def qacl_ace_to_readable(ace: Dict, is_directory: bool = False) -> str:
-    """
-    Convert a single Qumulo ACE to human-readable NFSv4-style format.
-
-    Args:
-        ace: Qumulo ACE dict with type, flags, trustee, rights
-        is_directory: Whether this ACE is for a directory
-
-    Returns:
-        Readable ACE string in format: Allow/Deny:flags:principal:permissions
-        Example: "Allow:fdI:uid:1001:rwxt"
-    """
-    # Convert type to human-readable form
-    ace_type = 'Allow' if ace.get('type') == 'ALLOWED' else 'Deny'
-
-    # Convert flags
-    flags_str = qacl_flags_to_nfsv4(ace.get('flags', []))
-
-    # Get trustee and trustee_details
-    trustee = ace.get('trustee', {})
-    trustee_details = ace.get('trustee_details')
-
-    # Convert trustee to principal
-    principal = qacl_trustee_to_nfsv4(trustee, trustee_details)
-
-    # Add 'g' flag if trustee is a group (unless it's GROUP@)
-    if trustee_details:
-        id_type = trustee_details.get('id_type')
-        if id_type in ('NFS_GID', 'LOCAL_GROUP', 'AD_GROUP'):
-            if principal not in ('GROUP@',):
-                flags_str = 'g' + flags_str
-    elif isinstance(trustee, dict):
-        domain = trustee.get('domain')
-        if domain in ('POSIX_GROUP', 'LOCAL_GROUP', 'AD_GROUP'):
-            if principal not in ('GROUP@',):
-                flags_str = 'g' + flags_str
-
-    # Convert rights
-    permissions = qacl_rights_to_nfsv4(ace.get('rights', []), is_directory)
-
-    return f'{ace_type}:{flags_str}:{principal}:{permissions}'
-
-
-def qacl_to_readable_acl(qacl_data: Dict, is_directory: bool = False,
-                         separator: str = '|') -> str:
-    """
-    Convert full Qumulo QACL to readable ACL string.
-
-    Args:
-        qacl_data: Full QACL dict - may have 'aces' directly or nested under 'acl'
-        is_directory: Whether this is a directory ACL
-        separator: Character to separate multiple ACEs (default: '|' for CSV)
-
-    Returns:
-        Separated ACL string suitable for CSV
-        Example: "Allow:fdI:uid:1001:rwxt|Allow:fdI:GROUP@:rxt|Allow::OWNER@:rwatTnNcy"
-    """
-    if not qacl_data:
-        return ''
-
-    # Handle nested structure (get_file_acl returns {generated: bool, acl: {...}})
-    if 'acl' in qacl_data and 'aces' not in qacl_data:
-        qacl_data = qacl_data['acl']
-
-    if 'aces' not in qacl_data:
-        return ''
-
-    readable_aces = []
-    for ace in qacl_data.get('aces', []):
-        readable_ace = qacl_ace_to_readable(ace, is_directory)
-        readable_aces.append(readable_ace)
-
-    return separator.join(readable_aces)
-
-
-def qacl_to_readable_acl_with_names(qacl_data: Dict, is_directory: bool = False,
-                                    separator: str = '|', identity_cache: Dict = None) -> str:
-    """
-    Convert full Qumulo QACL to readable ACL string with resolved names.
-
-    Args:
-        qacl_data: Full QACL dict - may have 'aces' directly or nested under 'acl'
-        is_directory: Whether this is a directory ACL
-        separator: Character to separate multiple ACEs (default: '|' for CSV)
-        identity_cache: Dictionary mapping auth_id to resolved identity info
-
-    Returns:
-        Separated ACL string with human-readable names
-        Example: "Allow:fdI:jsmith (UID 1001):rwxt|Allow:fdI:Domain Users:rxt"
-    """
-    if not qacl_data:
-        return ''
-
-    # Handle nested structure
-    if 'acl' in qacl_data and 'aces' not in qacl_data:
-        qacl_data = qacl_data['acl']
-
-    if 'aces' not in qacl_data:
-        return ''
-
-    if not identity_cache:
-        identity_cache = {}
-
-    readable_aces = []
-    for ace in qacl_data.get('aces', []):
-        # Convert type
-        ace_type = 'Allow' if ace.get('type') == 'ALLOWED' else 'Deny'
-
-        # Convert flags
-        flags_str = qacl_flags_to_nfsv4(ace.get('flags', []))
-
-        # Get trustee and details
-        trustee = ace.get('trustee', {})
-        trustee_details = ace.get('trustee_details')
-
-        # Resolve trustee name
-        principal = qacl_trustee_to_readable_name(trustee, trustee_details, identity_cache)
-
-        # Add 'g' flag for groups
-        if trustee_details:
-            id_type = trustee_details.get('id_type')
-            if id_type in ('NFS_GID', 'LOCAL_GROUP', 'AD_GROUP'):
-                if principal not in ('GROUP@',) and not principal.endswith(')'):  # Don't add 'g' if already formatted with GID
-                    flags_str = 'g' + flags_str
-        elif isinstance(trustee, dict):
-            domain = trustee.get('domain')
-            if domain in ('POSIX_GROUP', 'LOCAL_GROUP', 'AD_GROUP'):
-                if principal not in ('GROUP@',):
-                    flags_str = 'g' + flags_str
-
-        # Convert rights
-        permissions = qacl_rights_to_nfsv4(ace.get('rights', []), is_directory)
-
-        readable_aces.append(f'{ace_type}:{flags_str}:{principal}:{permissions}')
-
-    return separator.join(readable_aces)
-
-
-def create_acl_fingerprint(qacl_data: Dict) -> str:
-    """
-    Create a unique fingerprint/hash for an ACL based on its content.
-    Used for grouping files with identical ACLs.
-
-    Args:
-        qacl_data: Full QACL dict
-
-    Returns:
-        SHA-256 hash (first 16 chars) of the ACL structure
-    """
-    import hashlib
-    import json
-
-    if not qacl_data:
-        return 'empty'
-
-    # Handle nested structure
-    if 'acl' in qacl_data and 'aces' not in qacl_data:
-        qacl_data = qacl_data['acl']
-
-    # Extract and normalize ACL components for hashing
-    acl_to_hash = {
-        'aces': [],
-        'control': sorted(qacl_data.get('control', [])),
-        'posix_special_permissions': sorted(qacl_data.get('posix_special_permissions', []))
-    }
-
-    # Normalize each ACE for consistent hashing
-    for ace in qacl_data.get('aces', []):
-        trustee = ace.get('trustee')
-        trustee_details = ace.get('trustee_details', {})
-
-        # Create normalized trustee representation
-        if isinstance(trustee, dict):
-            trustee_key = f"{trustee.get('domain')}:{trustee.get('uid')}:{trustee.get('gid')}:{trustee.get('sid')}"
-        else:
-            # Use trustee_details for current API format
-            trustee_key = f"{trustee_details.get('id_type')}:{trustee_details.get('id_value')}"
-
-        normalized_ace = {
-            'type': ace.get('type'),
-            'flags': sorted(ace.get('flags', [])),
-            'trustee': trustee_key,
-            'rights': sorted(ace.get('rights', []))
-        }
-        acl_to_hash['aces'].append(normalized_ace)
-
-    # Create deterministic JSON and hash it
-    acl_json = json.dumps(acl_to_hash, sort_keys=True)
-    hash_digest = hashlib.sha256(acl_json.encode()).hexdigest()
-
-    # Return first 16 characters for readability
-    return hash_digest[:16]
-
-
-def analyze_acl_structure(qacl_data: Dict) -> Dict:
-    """
-    Analyze ACL structure and extract useful metadata.
-
-    Args:
-        qacl_data: Full QACL dict
-
-    Returns:
-        Dict with analysis results:
-        {
-            'ace_count': int,
-            'inherited_count': int,
-            'explicit_count': int,
-            'has_deny': bool,
-            'has_everyone': bool,
-            'trustees': list of principal strings,
-            'fingerprint': str
-        }
-    """
-    if not qacl_data:
-        return {
-            'ace_count': 0,
-            'inherited_count': 0,
-            'explicit_count': 0,
-            'has_deny': False,
-            'has_everyone': False,
-            'trustees': [],
-            'fingerprint': 'empty'
-        }
-
-    # Handle nested structure
-    if 'acl' in qacl_data and 'aces' not in qacl_data:
-        qacl_data = qacl_data['acl']
-
-    aces = qacl_data.get('aces', [])
-
-    ace_count = len(aces)
-    inherited_count = 0
-    explicit_count = 0
-    has_deny = False
-    has_everyone = False
-    trustees = set()
-
-    for ace in aces:
-        # Check for DENY entries
-        if ace.get('type') == 'DENIED':
-            has_deny = True
-
-        # Check for inherited ACEs
-        if 'INHERITED' in ace.get('flags', []):
-            inherited_count += 1
-        else:
-            explicit_count += 1
-
-        # Extract trustee
-        trustee = ace.get('trustee')
-        trustee_details = ace.get('trustee_details')
-        principal = qacl_trustee_to_nfsv4(trustee, trustee_details)
-        trustees.add(principal)
-
-        # Check for EVERYONE
-        if principal == 'EVERYONE@':
-            has_everyone = True
-
-    return {
-        'ace_count': ace_count,
-        'inherited_count': inherited_count,
-        'explicit_count': explicit_count,
-        'has_deny': has_deny,
-        'has_everyone': has_everyone,
-        'trustees': sorted(list(trustees)),
-        'fingerprint': create_acl_fingerprint(qacl_data)
-    }
-
-
-# ============================================================================
-# Duplicate Detection Functions
-# ============================================================================
-
-def calculate_sample_points(file_size: int, override: int = None) -> int:
-    """
-    Calculate number of sample points for duplicate detection.
-
-    Uses adaptive sampling based on file size:
-    - < 1 MB: 3 points
-    - < 100 MB: 5 points
-    - < 1 GB: 7 points
-    - < 10 GB: 9 points
-    - >= 10 GB: 11 points
-
-    Args:
-        file_size: Size of file in bytes
-        override: Optional override value (from --sample-points)
-
-    Returns:
-        Number of sample points to use (between 1 and 20)
-    """
-    if override is not None:
-        # Validate override is reasonable
-        if override < 1:
-            return 1
-        if override > 20:
-            return 20
-        return override
-
-    # Adaptive sampling based on file size
-    MB = 1024 * 1024
-    GB = 1024 * MB
-
-    if file_size < MB:
-        return 3
-    elif file_size < 100 * MB:
-        return 5
-    elif file_size < GB:
-        return 7
-    elif file_size < 10 * GB:
-        return 9
-    else:
-        return 11
-
-
-async def compute_quick_hash(
-    client: AsyncQumuloClient,
-    session: aiohttp.ClientSession,
-    path: str,
-    file_size: int
-) -> Optional[str]:
-    """
-    Compute quick hash from start+end of file for pre-screening.
-
-    Reads first 64KB + last 64KB (128KB total) and computes a fast hash.
-    Used in Phase 1.5 to quickly eliminate non-duplicates before performing
-    full multi-sample hashing.
-
-    Args:
-        client: AsyncQumuloClient instance
-        session: aiohttp ClientSession
-        path: Path to the file
-        file_size: Size of file in bytes
-
-    Returns:
-        Quick hash (hex string) or None if read fails
-    """
-    QUICK_SAMPLE_SIZE = 64 * 1024  # 64KB
-
-    if file_size == 0:
-        # Empty file
-        if HAS_XXHASH:
-            return xxhash.xxh3_128(b'').hexdigest()
-        else:
-            return hashlib.blake2b(b'').hexdigest()
-
-    # Read first 64KB
-    first_chunk = await client.read_file_chunk(session, path, 0, min(QUICK_SAMPLE_SIZE, file_size))
-    if first_chunk is None:
-        return None
-
-    # If file is small enough, we've read it all
-    if file_size <= QUICK_SAMPLE_SIZE:
-        if HAS_XXHASH:
-            return xxhash.xxh3_128(first_chunk).hexdigest()
-        else:
-            return hashlib.blake2b(first_chunk).hexdigest()
-
-    # Read last 64KB
-    last_offset = max(0, file_size - QUICK_SAMPLE_SIZE)
-    last_chunk = await client.read_file_chunk(session, path, last_offset, QUICK_SAMPLE_SIZE)
-    if last_chunk is None:
-        return None
-
-    # Concatenate and hash
-    combined = first_chunk + last_chunk
-    if HAS_XXHASH:
-        return xxhash.xxh3_128(combined).hexdigest()
-    else:
-        return hashlib.blake2b(combined).hexdigest()
-
-
-async def compute_sample_hash(
-    client: AsyncQumuloClient,
-    session: aiohttp.ClientSession,
-    path: str,
-    file_size: int,
-    num_samples: int
-) -> Optional[str]:
-    """
-    Compute hash of file content samples using the fastest available algorithm.
-
-    Reads size-scaled chunks at evenly distributed offsets throughout the file,
-    concatenates them, and computes a hash. This provides efficient content
-    verification for large files without reading the entire file.
-
-    Hash algorithm selection (fastest to slowest):
-    - xxHash3 (xxh3_128): 10-20x faster than SHA-256 (if xxhash package installed)
-    - BLAKE2b: 2-3x faster than SHA-256 (Python stdlib, fallback)
-
-    Sample size scaling (per sample):
-    - Files < 100MB: 64KB samples
-    - Files 100MB-1GB: 128KB samples
-    - Files 1GB-10GB: 256KB samples
-    - Files 10GB-100GB: 512KB samples
-    - Files > 100GB: 1MB samples (capped)
-
-    Sample distribution:
-    - First sample: always at offset 0 (beginning)
-    - Middle samples: evenly distributed throughout file
-    - Last sample: always at end of file (when num_samples >= 2)
-
-    Args:
-        client: AsyncQumuloClient instance
-        session: aiohttp ClientSession
-        path: Path to the file
-        file_size: Size of file in bytes
-        num_samples: Number of sample points to read
-
-    Returns:
-        Hash (hex string) of concatenated samples, or None if read fails
-    """
-    # Adaptive sample size based on file size
-    MB = 1024 * 1024
-    GB = 1024 * MB
-
-    if file_size < 100 * MB:
-        SAMPLE_SIZE = 64 * 1024  # 64KB
-    elif file_size < GB:
-        SAMPLE_SIZE = 128 * 1024  # 128KB
-    elif file_size < 10 * GB:
-        SAMPLE_SIZE = 256 * 1024  # 256KB
-    elif file_size < 100 * GB:
-        SAMPLE_SIZE = 512 * 1024  # 512KB
-    else:
-        SAMPLE_SIZE = 1 * MB  # 1MB (capped)
-
-    if file_size == 0:
-        # Empty file: hash of empty bytes
-        if HAS_XXHASH:
-            return xxhash.xxh3_128(b'').hexdigest()
-        else:
-            return hashlib.blake2b(b'').hexdigest()
-
-    if num_samples < 1:
-        num_samples = 1
-
-    # Calculate sample offsets
-    offsets = []
-
-    if num_samples == 1:
-        # Single sample at beginning
-        offsets = [0]
-    elif num_samples == 2:
-        # Beginning and end
-        offsets = [0, max(0, file_size - SAMPLE_SIZE)]
-    else:
-        # Evenly distributed: beginning, middle points, end
-        # For example, 5 samples: 0, 25%, 50%, 75%, end
-        step = file_size / (num_samples - 1)
-        offsets = [int(i * step) for i in range(num_samples - 1)]
-        # Last sample at end
-        offsets.append(max(0, file_size - SAMPLE_SIZE))
-
-    # Read all samples
-    samples = []
-    for offset in offsets:
-        # Don't read past end of file
-        read_length = min(SAMPLE_SIZE, file_size - offset)
-
-        if read_length <= 0:
-            continue
-
-        chunk = await client.read_file_chunk(session, path, offset, read_length)
-
-        if chunk is None:
-            # Failed to read chunk
-            return None
-
-        samples.append(chunk)
-
-    # Concatenate all samples and compute hash
-    # Prefer xxHash (10-20x faster) if available, otherwise BLAKE2b (2-3x faster than SHA-256)
-    concatenated = b''.join(samples)
-
-    if HAS_XXHASH:
-        hash_value = xxhash.xxh3_128(concatenated).hexdigest()
-    else:
-        hash_value = hashlib.blake2b(concatenated).hexdigest()
-
-    return hash_value
-
-
-# ==============================================================================
-# Range-based duplicate detection (--detect-duplicates)
-# ==============================================================================
-
-def sample_offsets(file_size: int, m: int = 4, r: int = 4, stable_id: str = "", window_size: int = 64 * 1024) -> List[int]:
-    """
-    Generate reproducible, non-overlapping sample offsets for Range-based duplicate detection.
-
-    Combines fixed (head/tail), stratified (evenly spaced), and deterministic random offsets.
-
-    Args:
-        file_size: Size of the file in bytes
-        m: Number of stratified (evenly spaced) sample points
-        r: Number of random sample points
-        stable_id: Stable identifier for deterministic random generation (e.g., file path)
-        window_size: Size of each sampling window in bytes (default: 64 KiB)
-
-    Returns:
-        Sorted list of non-overlapping byte offsets
-    """
-    import random
-
-    offsets = []
-
-    def add_offset(pos: int) -> bool:
-        """Add offset if it doesn't overlap with existing ones."""
-        # Clamp into valid range [0, file_size - window_size]
-        pos = max(0, min(max(0, file_size - window_size), pos))
-
-        # Check for overlaps
-        for existing in offsets:
-            # Overlap check: positions overlap if not (pos + W <= existing OR existing + W <= pos)
-            if not (pos + window_size <= existing or existing + window_size <= pos):
-                return False
-
-        offsets.append(pos)
-        return True
-
-    if file_size <= 0:
-        return [0]
-
-    # Fixed offsets: head and tail
-    add_offset(0)  # Start of file
-    add_offset(file_size - window_size if file_size >= window_size else 0)  # End of file
-
-    # Stratified offsets: evenly spaced through the file
-    for i in range(1, m + 1):
-        pos = int(round(i * file_size / (m + 1) - window_size / 2))
-        add_offset(pos)
-
-    # Deterministic random offsets: seeded by file_size and stable_id
-    if HAS_XXHASH:
-        seed_bytes = xxhash.xxh3_64(f"{file_size}|{stable_id}".encode()).digest()
-    else:
-        seed_bytes = hashlib.blake2b(f"{file_size}|{stable_id}".encode(), digest_size=8).digest()
-
-    seed = int.from_bytes(seed_bytes[:8], "little")
-    rng = random.Random(seed)
-
-    tries = 0
-    target = 2 + m + r  # Total target: 2 fixed + m stratified + r random
-    max_tries = 10_000
-
-    while len(offsets) < target and tries < max_tries:
-        pos = rng.randrange(0, max(1, file_size - window_size + 1))
-        if add_offset(pos):
-            continue
-        tries += 1
-
-    return sorted(offsets)
-
-
-async def range_read(
-    session: aiohttp.ClientSession,
-    url: str,
-    start: int,
-    length: int,
-    timeout: int = 30
-) -> Optional[bytes]:
-    """
-    Read a specific byte range from a URL using HTTP Range header.
-
-    Args:
-        session: aiohttp ClientSession
-        url: Full URL to read from
-        start: Starting byte offset
-        length: Number of bytes to read
-        timeout: Request timeout in seconds
-
-    Returns:
-        Bytes read from the range, or None if failed
-    """
-    end = start + length - 1
-    headers = {"Range": f"bytes={start}-{end}"}
-
-    try:
-        async with session.get(url, headers=headers, timeout=timeout) as response:
-            if response.status == 206:  # Partial Content
-                return await response.read()
-            elif response.status == 200:
-                # Server doesn't support Range requests, read everything and slice
-                data = await response.read()
-                return data[start:start + length]
-            else:
-                return None
-    except Exception:
-        return None
-
-
-async def sampled_fingerprint(
-    client: AsyncQumuloClient,
-    session: aiohttp.ClientSession,
-    file_path: str,
-    file_size: int,
-    stable_id: str,
-    m: int = 4,
-    r: int = 4,
-    window_size: int = 64 * 1024
-) -> Optional[str]:
-    """
-    Compute position-aware fingerprint using Range-based sampling.
-
-    Creates a hash that includes both the content and position of sampled windows,
-    making it sensitive to byte shifts and modifications.
-
-    Args:
-        client: AsyncQumuloClient instance
-        session: aiohttp ClientSession
-        file_path: Path to the file on the cluster
-        file_size: Size of the file in bytes
-        stable_id: Stable identifier for deterministic offset generation
-        m: Number of stratified sample points
-        r: Number of random sample points
-        window_size: Size of each sampling window
-
-    Returns:
-        Hex string of the xxHash fingerprint, or None if failed
-    """
-    import struct
-
-    # Generate sample offsets
-    offsets = sample_offsets(file_size, m, r, stable_id, window_size)
-
-    # Initialize hash
-    if HAS_XXHASH:
-        hasher = xxhash.xxh3_128()
-    else:
-        hasher = hashlib.blake2b()
-
-    # Read each window and update hash with position + content
-    for offset in offsets:
-        chunk_length = min(window_size, max(0, file_size - offset))
-
-        if chunk_length <= 0:
-            continue
-
-        # Read the range using existing client method
-        data = await client.read_file_chunk(session, file_path, offset, chunk_length)
-
-        if data is None:
-            return None
-
-        # Hash format: offset (8 bytes) + length (8 bytes) + data
-        hasher.update(struct.pack("<Q", offset))
-        hasher.update(struct.pack("<Q", len(data)))
-        hasher.update(data)
-
-    return hasher.hexdigest()
-
-
-async def detect_duplicates(
-    client: AsyncQumuloClient,
-    files: List[Dict],
-    show_progress: bool = False,
-    verbose: bool = False
-) -> Dict[str, List[Dict]]:
-    """
-    Detect duplicate files using efficient Range-based sampling with tiered escalation.
-
-    Uses HTTP Range requests to read small windows (64 KiB) from files, combining
-    fixed, stratified, and random offsets for high-confidence duplicate detection
-    with minimal data transfer. Supports tiered escalation for stubborn matches.
-
-    Tier 1: m=4, r=4 (~512 KiB per 50MB file) - moderate confidence
-    Tier 2: m=6, r=10 (~1.0 MiB per 50MB file) - high confidence
-    Tier 3: m=6, r=32 (~2.0 MiB per 50MB file) - very high confidence
-
-    Args:
-        client: AsyncQumuloClient instance
-        files: List of file dictionaries with path, size, etc.
-        show_progress: Show progress information
-        verbose: Show detailed logging
-
-    Returns:
-        Dictionary mapping fingerprints to lists of duplicate files
-        Format: {fingerprint: [file1, file2, ...]}
-        Only includes groups with 2+ files
-    """
-    from collections import defaultdict
-
-    if show_progress:
-        print(f"\n{'=' * 70}")
-        print("RANGE-BASED DUPLICATE DETECTION")
-        print(f"{'=' * 70}")
-        print("\nUsing efficient Range-based sampling (64 KiB windows)")
-        print("Tiered escalation: 512 KiB → 1.0 MiB → 2.0 MiB per file")
-        print(f"{'=' * 70}")
-
-    # Phase 1: Group by size (exact size match required for duplicates)
-    if verbose:
-        print(f"\n[DETECT DUPLICATES] Phase 1: Grouping {len(files):,} files by size")
-
-    size_groups = defaultdict(list)
-    for entry in files:
-        size = int(entry.get('size', 0))
-        size_groups[size].append(entry)
-
-    # Filter to only groups with 2+ files
-    potential_duplicates = {k: v for k, v in size_groups.items() if len(v) >= 2}
-
-    if verbose:
-        total_potential = sum(len(v) for v in potential_duplicates.values())
-        print(f"[DETECT DUPLICATES] Found {total_potential:,} potential duplicates in {len(potential_duplicates):,} size groups")
-
-    if not potential_duplicates:
-        if show_progress:
-            print("\nNo duplicate files found.")
-        return {}
-
-    # Phase 2: Tier 1 sampling (m=4, r=4) - moderate confidence
-    if verbose:
-        print(f"\n[DETECT DUPLICATES] Phase 2: Tier 1 sampling (m=4, r=4)")
-
-    tier1_groups = await _detect_duplicates_tier(
-        client, potential_duplicates, m=4, r=4,
-        tier_name="Tier 1", show_progress=show_progress, verbose=verbose
-    )
-
-    if verbose:
-        total_tier1 = sum(len(v) for v in tier1_groups.values())
-        print(f"[DETECT DUPLICATES] Tier 1 found {total_tier1:,} matches in {len(tier1_groups):,} groups")
-
-    # Phase 3: Tier 2 escalation (m=6, r=10) - high confidence
-    # Only escalate groups with 2+ files
-    tier2_candidates = {k: v for k, v in tier1_groups.items() if len(v) >= 2}
-
-    if tier2_candidates:
-        # Convert fingerprint groups back to size groups for tier processing
-        tier2_size_groups = defaultdict(list)
-        for files in tier2_candidates.values():
-            for f in files:
-                size = int(f.get('size', 0))
-                tier2_size_groups[size].append(f)
-
-        if verbose:
-            total_tier2_input = sum(len(v) for v in tier2_size_groups.values())
-            print(f"\n[DETECT DUPLICATES] Phase 3: Tier 2 escalation (m=6, r=10) for {total_tier2_input:,} files")
-
-        tier2_groups = await _detect_duplicates_tier(
-            client, tier2_size_groups, m=6, r=10,
-            tier_name="Tier 2", show_progress=show_progress, verbose=verbose
-        )
-
-        if verbose:
-            total_tier2 = sum(len(v) for v in tier2_groups.values())
-            print(f"[DETECT DUPLICATES] Tier 2 found {total_tier2:,} matches in {len(tier2_groups):,} groups")
-    else:
-        tier2_groups = {}
-
-    # Phase 4: Tier 3 escalation (m=6, r=32) - very high confidence
-    # Only escalate groups with 2+ files
-    tier3_candidates = {k: v for k, v in tier2_groups.items() if len(v) >= 2}
-
-    if tier3_candidates:
-        # Convert fingerprint groups back to size groups for tier processing
-        tier3_size_groups = defaultdict(list)
-        for files in tier3_candidates.values():
-            for f in files:
-                size = int(f.get('size', 0))
-                tier3_size_groups[size].append(f)
-
-        if verbose:
-            total_tier3_input = sum(len(v) for v in tier3_size_groups.values())
-            print(f"\n[DETECT DUPLICATES] Phase 4: Tier 3 escalation (m=6, r=32) for {total_tier3_input:,} files")
-
-        tier3_groups = await _detect_duplicates_tier(
-            client, tier3_size_groups, m=6, r=32,
-            tier_name="Tier 3", show_progress=show_progress, verbose=verbose
-        )
-
-        if verbose:
-            total_tier3 = sum(len(v) for v in tier3_groups.values())
-            print(f"[DETECT DUPLICATES] Tier 3 found {total_tier3:,} matches in {len(tier3_groups):,} groups")
-
-        final_groups = tier3_groups
-    else:
-        final_groups = tier2_groups
-
-    # Filter to only groups with 2+ files (actual duplicates)
-    duplicates = {k: v for k, v in final_groups.items() if len(v) >= 2}
-
-    if show_progress or verbose:
-        total_duplicates = sum(len(v) for v in duplicates.values())
-        print(f"\n[DETECT DUPLICATES] Found {total_duplicates:,} confirmed duplicates in {len(duplicates):,} groups")
-
-    return duplicates
-
-
-async def _detect_duplicates_tier(
-    client: AsyncQumuloClient,
-    size_groups: Dict[int, List[Dict]],
-    m: int,
-    r: int,
-    tier_name: str = "Tier",
-    show_progress: bool = False,
-    verbose: bool = False
-) -> Dict[str, List[Dict]]:
-    """
-    Helper function to compute fingerprints for one tier of sampling.
-
-    Args:
-        client: AsyncQumuloClient instance
-        size_groups: Dict mapping file size to list of files
-        m: Number of stratified sample points
-        r: Number of random sample points
-        tier_name: Name for progress display
-        show_progress: Show progress
-        verbose: Show verbose logging
-
-    Returns:
-        Dict mapping fingerprints to lists of files
-    """
-    from collections import defaultdict
-
-    hash_groups = defaultdict(list)
-
-    # Calculate total files to process
-    total_files = sum(len(group) for group in size_groups.values())
-    files_processed = 0
-    hash_start_time = time.time()
-    last_progress_update = time.time()
-    is_tty = sys.stderr.isatty() if show_progress else False
-
-    # Create session for Range requests
-    async with client.create_session() as session:
-        # Limit concurrent fingerprint operations
-        # Each fingerprint does (2 + m + r) Range requests
-        # Connection pool is ~100, so limit concurrent ops to avoid saturation
-        samples_per_file = 2 + m + r
-        MAX_CONCURRENT = max(5, min(50, 80 // samples_per_file))
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-        async def compute_with_limit(entry, file_path, file_size):
-            """Wrapper to limit concurrent fingerprint operations."""
-            async with semaphore:
-                return await sampled_fingerprint(
-                    client, session, file_path, file_size,
-                    stable_id=file_path, m=m, r=r
-                )
-
-        # Process each size group
-        for file_size, group in size_groups.items():
-            # Compute fingerprints for all files in this group
-            tasks = []
-            for entry in group:
-                file_path = entry['path']
-                task = compute_with_limit(entry, file_path, file_size)
-                tasks.append((entry, task))
-
-            # Wait for all fingerprints in this group
-            results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
-
-            # Group by fingerprint
-            for (entry, _), fingerprint in zip(tasks, results):
-                if fingerprint and not isinstance(fingerprint, Exception):
-                    hash_groups[fingerprint].append(entry)
-
-                files_processed += 1
-
-                # Update progress
-                if show_progress:
-                    current_time = time.time()
-                    elapsed = current_time - hash_start_time
-                    rate = files_processed / elapsed if elapsed > 0 else 0
-                    remaining = total_files - files_processed
-
-                    progress_msg = (f"[{tier_name}] {files_processed:,} / {total_files:,} processed | "
-                                  f"{remaining:,} remaining | {rate:.1f} files/sec")
-
-                    # Only update progress display every 0.5 seconds
-                    if is_tty:
-                        print(f"\r{progress_msg}", end='', file=sys.stderr, flush=True)
-                    elif verbose and (current_time - last_progress_update) > 0.5:
-                        print(progress_msg, file=sys.stderr, flush=True)
-                        last_progress_update = current_time
-
-    # Print final summary
-    if show_progress and is_tty:
-        elapsed = time.time() - hash_start_time
-        rate = files_processed / elapsed if elapsed > 0 else 0
-        print(f"\r[{tier_name}] FINAL: {files_processed:,} files processed | {rate:.1f} files/sec | {elapsed:.1f}s",
-              file=sys.stderr)
-    elif show_progress and verbose:
-        elapsed = time.time() - hash_start_time
-        rate = files_processed / elapsed if elapsed > 0 else 0
-        print(f"[{tier_name}] FINAL: {files_processed:,} files processed | {rate:.1f} files/sec | {elapsed:.1f}s",
-              file=sys.stderr)
-
-    return hash_groups
-
-
-async def find_duplicates(
-    client: AsyncQumuloClient,
-    files: List[Dict],
-    by_size_only: bool = False,
-    sample_points_override: int = None,
-    show_progress: bool = False,
-    verbose: bool = False
-) -> Dict[str, List[Dict]]:
-    """
-    Find duplicate files using metadata filtering and sample hashing.
-
-    Two-phase approach:
-    1. Group files by metadata fingerprint (size:datablocks:sparse) - NO file I/O
-    2. Compute sample hashes for potential duplicates - with batching + semaphore
-
-    Args:
-        client: AsyncQumuloClient instance
-        files: List of file dictionaries with path, size, datablocks, etc.
-        by_size_only: If True, use size-only detection (fast, may have false positives)
-        sample_points_override: Override adaptive sampling (from --sample-points)
-        show_progress: Show progress information
-        verbose: Show detailed logging
-
-    Returns:
-        Dictionary mapping fingerprints to lists of duplicate files
-        Format: {fingerprint: [file1, file2, ...]}
-        Only includes groups with 2+ files
-    """
-    from collections import defaultdict
-
-    print(f"[DEBUG] find_duplicates() called with {len(files)} files", file=sys.stderr, flush=True)
-
-    if show_progress:
-        print(f"\n{'=' * 70}")
-        print("DUPLICATE DETECTION")
-        print(f"{'=' * 70}")
-        if not by_size_only:
-            print("\nWARNING: This uses sampling-based content verification.")
-            print("Results are advisory only. Small differences in large files")
-            print("may be missed. Verify duplicates before deletion.")
-            print(f"{'=' * 70}")
-
-    # Phase 1: Group by metadata fingerprint
-    if verbose:
-        print(f"\n[DUPLICATE DETECTION] Phase 1: Metadata pre-filtering {len(files):,} files")
-
-    metadata_groups = defaultdict(list)
-
-    for entry in files:
-        size = int(entry.get('size', 0))
-        datablocks = entry.get('datablocks', 'unknown')
-        sparse = entry.get('extended_attributes', {}).get('sparse_file', False)
-
-        # Create metadata fingerprint
-        if by_size_only:
-            fingerprint = f"{size}"
-        else:
-            fingerprint = f"{size}:{datablocks}:{sparse}"
-        metadata_groups[fingerprint].append(entry)
-
-    # Filter to only groups with 2+ files
-    potential_duplicates = {k: v for k, v in metadata_groups.items() if len(v) >= 2}
-
-    if verbose:
-        total_potential = sum(len(v) for v in potential_duplicates.values())
-        print(f"[DUPLICATE DETECTION] Found {total_potential:,} potential duplicates in {len(potential_duplicates):,} groups")
-        print(f"[DUPLICATE DETECTION] Total metadata groups: {len(metadata_groups):,}")
-        # Show first 3 fingerprints for debugging
-        for i, (fp, group) in enumerate(list(metadata_groups.items())[:3]):
-            print(f"[DUPLICATE DETECTION]   Sample fingerprint {i+1}: {fp} ({len(group)} files)")
-
-    if not potential_duplicates:
-        if show_progress:
-            print("\nNo duplicate files found.")
-        return {}
-
-    # If size-only mode, return now
-    if by_size_only:
-        if show_progress:
-            total_groups = len(potential_duplicates)
-            total_files = sum(len(g) for g in potential_duplicates.values())
-            print(f"\nFound {total_groups:,} duplicate groups ({total_files:,} files)")
-            print("Note: Size-only detection may include false positives")
-        return potential_duplicates
-
-    # Phase 2: Compute sample hashes for potential duplicates
-    if verbose:
-        print(f"\n[DUPLICATE DETECTION] Phase 2: Computing sample hashes")
-
-    hash_groups = defaultdict(list)
-    BATCH_SIZE = 1000  # Process files in batches to avoid overwhelming the system
-
-    # Limit concurrent hash operations to avoid overwhelming connection pool
-    # Each hash operation does N API calls (where N = sample points)
-    # Connection pool size is ~100, so we want: concurrent_hashes * sample_points ≤ 80
-    # This leaves some headroom for other operations
-    # Calculate based on actual sample_points being used
-    avg_sample_points = sample_points_override if sample_points_override else 7  # Default adaptive is ~7
-    MAX_CONCURRENT_HASHES = max(10, min(80, 80 // avg_sample_points))
-
-    # Track progress across all groups
-    total_files_to_hash = sum(len(group) for group in potential_duplicates.values())
-    files_hashed = 0
-    hash_start_time = time.time()
-    last_progress_update = time.time()
-    is_tty = sys.stderr.isatty() if show_progress else False
-
-    # Create semaphore to limit concurrent hash operations
-    hash_semaphore = asyncio.Semaphore(MAX_CONCURRENT_HASHES)
-
-    # Create a fresh session for Phase 2 hashing operations
-    print(f"[DEBUG] About to create session for hashing {total_files_to_hash} files...", file=sys.stderr, flush=True)
-    async with client.create_session() as session:
-        print(f"[DEBUG] Session created successfully", file=sys.stderr, flush=True)
-        async def hash_with_limit(entry, file_path, file_size, sample_points):
-            """Wrapper to limit concurrent hash operations."""
-            async with hash_semaphore:
-                return await compute_sample_hash(client, session, file_path, file_size, sample_points)
-        for fingerprint, group in potential_duplicates.items():
-            # Extract size from fingerprint
-            size_str = fingerprint.split(':')[0]
-            file_size = int(size_str)
-
-            if verbose:
-                print(f"[DUPLICATE DETECTION] Processing group {fingerprint}: {len(group)} files")
-
-            # Process files in batches
-            for i in range(0, len(group), BATCH_SIZE):
-                batch = group[i:i + BATCH_SIZE]
-
-                # Compute hashes for this batch with concurrency limit
-                tasks = []
-                for entry in batch:
-                    file_path = entry['path']
-                    # Calculate adaptive sample points (or use override if specified)
-                    num_samples = calculate_sample_points(file_size, sample_points_override)
-                    task = hash_with_limit(entry, file_path, file_size, num_samples)
-                    tasks.append((entry, task))
-
-                # Wait for all hashes in this batch to complete
-                results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
-
-                # Group by hash
-                hash_success = 0
-                hash_failures = 0
-                for (entry, _), sample_hash in zip(tasks, results):
-                    if sample_hash and not isinstance(sample_hash, Exception):
-                        # Create combined fingerprint: metadata + hash
-                        combined_fingerprint = f"{fingerprint}:{sample_hash}"
-                        hash_groups[combined_fingerprint].append(entry)
-                        hash_success += 1
-                    else:
-                        hash_failures += 1
-                        if verbose and hash_failures <= 3:  # Only print first 3 errors
-                            print(f"[DUPLICATE DETECTION] Hash failed for {entry.get('path', 'unknown')}: {sample_hash}")
-
-                if verbose and hash_failures > 3:
-                    print(f"[DUPLICATE DETECTION] ... and {hash_failures - 3} more hash failures in this batch")
-
-                # Update progress
-                files_hashed += len(batch)
-
-                if show_progress:
-                    current_time = time.time()
-                    elapsed = current_time - hash_start_time
-                    rate = files_hashed / elapsed if elapsed > 0 else 0
-                    remaining = total_files_to_hash - files_hashed
-
-                    progress_msg = (f"[DUPLICATE DETECTION] {files_hashed:,} / {total_files_to_hash:,} hashed | "
-                                  f"{remaining:,} remaining | {rate:.1f} files/sec")
-
-                    # Only update progress display every 0.5 seconds
-                    if is_tty:
-                        # Always overwrite in TTY mode
-                        print(f"\r{progress_msg}", end='', file=sys.stderr, flush=True)
-                    elif verbose and (current_time - last_progress_update) > 0.5:
-                        # Only print on new line when redirected AND enough time has passed
-                        print(progress_msg, file=sys.stderr, flush=True)
-                        last_progress_update = current_time
-
-    # Print final summary
-    if show_progress and is_tty:
-        elapsed = time.time() - hash_start_time
-        rate = files_hashed / elapsed if elapsed > 0 else 0
-        print(f"\r[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
-    elif show_progress and verbose:
-        elapsed = time.time() - hash_start_time
-        rate = files_hashed / elapsed if elapsed > 0 else 0
-        print(f"[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
-
-    # Filter to only groups with 2+ files (actual duplicates)
-    duplicates = {k: v for k, v in hash_groups.items() if len(v) >= 2}
-
-    if show_progress or verbose:
-        total_duplicates = sum(len(v) for v in duplicates.values())
-        print(f"[DUPLICATE DETECTION] Found {total_duplicates:,} confirmed duplicates in {len(duplicates):,} groups")
-
-    return duplicates
-
-
-async def generate_acl_report(
-    client: AsyncQumuloClient,
-    session: aiohttp.ClientSession,
-    files: List[Dict],
-    show_progress: bool = False,
-    resolve_names: bool = False,
-    show_owner: bool = False,
-    show_group: bool = False
-) -> Dict:
-    """
-    Generate ACL report for a list of files.
-
-    Args:
-        client: AsyncQumuloClient instance
-        session: aiohttp session
-        files: List of file dicts (with 'path' and 'type' keys)
-        show_progress: Whether to show progress updates
-        resolve_names: Whether to resolve auth_ids to human-readable names
-        show_owner: Whether to resolve and display owner information
-        show_group: Whether to resolve and display group information
-
-    Returns:
-        Dictionary containing:
-        - file_acls: Dict mapping file path to ACL info
-        - stats: Summary statistics
-        - identity_cache: Dict mapping auth_id to resolved identity (if resolve_names=True or show_owner/show_group=True)
-    """
-    import sys
-    import time
-
-    file_acls = {}
-    total_files = len(files)
-    processed = 0
-    start_time = time.time()
-
-    # Batch size for ACL retrieval - increased for better throughput
-    batch_size = 100
-
-    for i in range(0, total_files, batch_size):
-        batch = files[i:i + batch_size]
-
-        # Fetch ACLs concurrently within batch
-        tasks = []
-        path_info = []
-        for file_info in batch:
-            path = file_info['path']
-            is_directory = file_info.get('type') == 'FS_FILE_TYPE_DIRECTORY'
-            owner = file_info.get('owner')
-            owner_details = file_info.get('owner_details', {})
-            group = file_info.get('group')
-            group_details = file_info.get('group_details', {})
-            task = client.get_file_acl(session, path)
-            tasks.append(task)
-            path_info.append((path, is_directory, owner, owner_details, group, group_details))
-
-        # Wait for all tasks concurrently using gather
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process results
-        for (path, is_directory, owner, owner_details, group, group_details), result in zip(path_info, results):
-            if isinstance(result, Exception):
-                # Task raised an exception
-                if client.verbose:
-                    print(f"[WARN] Error processing ACL for {path}: {result}", file=sys.stderr)
-                file_acls[path] = {
-                    'acl_data': None,
-                    'is_directory': is_directory,
-                    'owner': owner,
-                    'owner_details': owner_details,
-                    'group': group,
-                    'group_details': group_details
-                }
-            elif result:
-                # Successfully got ACL data
-                file_acls[path] = {
-                    'acl_data': result,
-                    'is_directory': is_directory,
-                    'owner': owner,
-                    'owner_details': owner_details,
-                    'group': group,
-                    'group_details': group_details
-                }
-            else:
-                # ACL retrieval returned None
-                file_acls[path] = {
-                    'acl_data': None,
-                    'is_directory': is_directory,
-                    'owner': owner,
-                    'owner_details': owner_details,
-                    'group': group,
-                    'group_details': group_details
-                }
-
-            processed += 1
-
-        # Progress update
-        if show_progress and processed > 0:
-            elapsed = time.time() - start_time
-            rate = processed / elapsed if elapsed > 0 else 0
-            remaining = total_files - processed
-
-            # TTY-aware progress (use \r for overwrite on terminal)
-            if sys.stderr.isatty():
-                print(
-                    f"\r[ACL REPORT] {processed:,} / {total_files:,} processed | "
-                    f"{remaining:,} remaining | {rate:.1f} files/sec",
-                    end='',
-                    file=sys.stderr,
-                    flush=True
-                )
-            else:
-                # For non-TTY, print periodic updates
-                if processed % 1000 == 0 or processed == total_files:
-                    print(
-                        f"[ACL REPORT] {processed:,} / {total_files:,} processed | "
-                        f"{remaining:,} remaining | {rate:.1f} files/sec",
-                        file=sys.stderr
-                    )
-
-    if show_progress:
-        if sys.stderr.isatty():
-            print(file=sys.stderr)  # New line after progress
-        print(f"[ACL REPORT] Completed processing {total_files:,} files", file=sys.stderr)
-
-    # Calculate statistics
-    files_with_acls = sum(1 for info in file_acls.values() if info['acl_data'] is not None)
-
-    stats = {
-        'total_files': total_files,
-        'files_with_acls': files_with_acls,
-        'processing_time': time.time() - start_time
-    }
-
-    # Resolve names if requested (for ACLs, owners, or groups)
-    identity_cache = {}
-    if resolve_names or show_owner or show_group:
-        # Collect all unique auth_ids
-        all_auth_ids = set()
-
-        # Collect from ACLs if resolve_names is enabled
-        if resolve_names:
-            for file_info in file_acls.values():
-                acl_data = file_info.get('acl_data')
-                if acl_data:
-                    auth_ids = extract_auth_ids_from_acl(acl_data)
-                    all_auth_ids.update(auth_ids)
-
-        # Collect owner auth_ids if show_owner is enabled
-        if show_owner:
-            for file_info in file_acls.values():
-                # Try to get auth_id from owner_details first, fallback to owner field
-                owner_details = file_info.get('owner_details', {})
-                owner_auth_id = owner_details.get('auth_id') or file_info.get('owner')
-                if owner_auth_id:
-                    all_auth_ids.add(owner_auth_id)
-
-        # Collect group auth_ids if show_group is enabled
-        if show_group:
-            for file_info in file_acls.values():
-                # Try to get auth_id from group_details first, fallback to group field
-                group_details = file_info.get('group_details', {})
-                group_auth_id = group_details.get('auth_id') or file_info.get('group')
-                if group_auth_id:
-                    all_auth_ids.add(group_auth_id)
-
-        if all_auth_ids and show_progress:
-            print(f"[ACL REPORT] Resolving {len(all_auth_ids)} unique identities...", file=sys.stderr)
-
-        # Resolve identities using existing infrastructure
-        if all_auth_ids:
-            identity_cache = await client.resolve_multiple_identities(
-                session,
-                list(all_auth_ids),
-                show_progress=show_progress
-            )
-
-    return {
-        'file_acls': file_acls,
-        'stats': stats,
-        'identity_cache': identity_cache
-    }
-
-
 def parse_trustee(trustee_input: str) -> Dict:
     """
     Parse various trustee formats into an API payload.
@@ -3546,6 +1825,278 @@ def parse_size_to_bytes(size_str: str) -> int:
         raise ValueError(f"Unknown size unit: {size_unit}")
 
     return int(size_num * multipliers[size_unit])
+
+
+def calculate_confidence_percentage(num_sample_points: int) -> str:
+    """
+    Calculate confidence percentage for duplicate detection based on sample points.
+
+    Args:
+        num_sample_points: Number of sample points used
+
+    Returns:
+        Human-readable confidence string
+    """
+    # Each 64KB sample with SHA-256 has 2^256 possible values
+    # Collision probability for independent samples: 1 / (2^256)^n
+    # For practical purposes, anything beyond 10^-40 is effectively 100%
+
+    # Rough approximation of confidence:
+    # 3 points: 99.999999999999999999999999999999999999999999999999% (10^-50)
+    # 5 points: effectively 100% (10^-80)
+    # 7+ points: effectively 100% (10^-110+)
+
+    if num_sample_points >= 5:
+        return ">99.9999999999999999999999999999%"
+    elif num_sample_points >= 3:
+        return ">99.99999999999999999999999%"
+    else:
+        return ">99.999%"
+
+
+def calculate_sample_points(file_size: int, sample_points: Optional[int] = None) -> List[int]:
+    """
+    Calculate adaptive sample points based on file size.
+
+    Args:
+        file_size: Size of the file in bytes
+        sample_points: Override number of sample points (3-11), or None for adaptive
+
+    Returns:
+        List of byte offsets to sample from
+    """
+    SAMPLE_CHUNK_SIZE = 65536  # 64KB per sample
+
+    # Special case: empty files
+    if file_size == 0:
+        return [0]  # Single sample at offset 0 (will read 0 bytes)
+
+    # User override
+    if sample_points is not None:
+        num_points = max(3, min(11, sample_points))  # Clamp to 3-11
+    else:
+        # Adaptive based on file size
+        if file_size < 1_000_000:  # < 1MB
+            num_points = 3
+        elif file_size < 100_000_000:  # < 100MB
+            num_points = 5
+        elif file_size < 1_000_000_000:  # < 1GB
+            num_points = 7
+        elif file_size < 10_000_000_000:  # < 10GB
+            num_points = 9
+        else:  # >= 10GB
+            num_points = 11
+
+    # Calculate evenly distributed offsets
+    offsets = []
+    for i in range(num_points):
+        # Distribute points evenly: 0%, ~14%, ~28%, ..., ~85%, ~100%
+        position = i / (num_points - 1) if num_points > 1 else 0
+        offset = int(position * file_size)
+
+        # Ensure we don't read past end of file
+        if offset + SAMPLE_CHUNK_SIZE > file_size:
+            offset = max(0, file_size - SAMPLE_CHUNK_SIZE)
+
+        offsets.append(offset)
+
+    # Remove duplicates (can happen with very small files) and sort
+    return sorted(set(offsets))
+
+
+async def compute_sample_hash(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    file_path: str,
+    file_size: int,
+    sample_points: Optional[int] = None
+) -> Optional[str]:
+    """
+    Compute a hash from multiple sample points in a file.
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp ClientSession
+        file_path: Path to the file
+        file_size: Size of the file in bytes
+        sample_points: Optional override for number of sample points
+
+    Returns:
+        SHA-256 hash of concatenated samples, or None if failed
+    """
+    import hashlib
+
+    SAMPLE_CHUNK_SIZE = 65536  # 64KB
+
+    offsets = calculate_sample_points(file_size, sample_points)
+
+    # Read all sample points concurrently
+    tasks = []
+    for offset in offsets:
+        task = client.read_file_chunk(session, file_path, offset, SAMPLE_CHUNK_SIZE)
+        tasks.append(task)
+
+    chunks = await asyncio.gather(*tasks)
+
+    # Check if any reads failed
+    if None in chunks:
+        return None
+
+    # Concatenate all chunks and hash
+    combined = b''.join(chunks)
+    hash_digest = hashlib.sha256(combined).hexdigest()
+
+    return hash_digest
+
+
+async def find_duplicates(
+    client: AsyncQumuloClient,
+    files: List[Dict],
+    by_size_only: bool = False,
+    sample_points: Optional[int] = None,
+    progress: Optional['ProgressTracker'] = None
+) -> Dict[str, List[Dict]]:
+    """
+    Find duplicate files using metadata filtering and sample hashing.
+
+    Phase 1: Group by size + datablocks + sparse_file (instant)
+    Phase 2: Compute sample hashes for potential duplicates (fast)
+    Phase 3: Return groups of duplicates
+
+    Args:
+        client: AsyncQumuloClient instance
+        files: List of file entries with metadata
+        by_size_only: If True, only use size for duplicate detection (no hashing)
+        sample_points: Optional override for number of sample points
+        progress: Optional ProgressTracker for status updates
+
+    Returns:
+        Dictionary mapping fingerprint -> list of duplicate files
+    """
+    from collections import defaultdict
+
+    if progress and progress.verbose:
+        print(f"[DUPLICATE DETECTION] Phase 1: Metadata pre-filtering {len(files):,} files", file=sys.stderr)
+
+    # Phase 1: Group by metadata (size, datablocks, sparse_file)
+    metadata_groups = defaultdict(list)
+
+    for entry in files:
+        size = int(entry.get('size', 0))
+        datablocks = entry.get('datablocks', 'unknown')
+        sparse = entry.get('extended_attributes', {}).get('sparse_file', False)
+
+        # Create metadata fingerprint
+        fingerprint = f"{size}:{datablocks}:{sparse}"
+        metadata_groups[fingerprint].append(entry)
+
+    # Filter to only groups with 2+ files
+    potential_duplicates = {k: v for k, v in metadata_groups.items() if len(v) >= 2}
+
+    if progress and progress.verbose:
+        total_potential = sum(len(v) for v in potential_duplicates.values())
+        print(f"[DUPLICATE DETECTION] Found {total_potential:,} potential duplicates in {len(potential_duplicates):,} groups", file=sys.stderr)
+
+    # If size-only mode, return now
+    if by_size_only:
+        return potential_duplicates
+
+    # Phase 2: Compute sample hashes for potential duplicates
+    if progress and progress.verbose:
+        print(f"[DUPLICATE DETECTION] Phase 2: Computing sample hashes", file=sys.stderr)
+
+    hash_groups = defaultdict(list)
+    BATCH_SIZE = 1000  # Process files in batches to avoid overwhelming the system
+
+    # Limit concurrent hash operations to avoid overwhelming connection pool
+    # Each hash operation does N API calls (where N = sample points)
+    # Connection pool size is ~100, so we want: concurrent_hashes * sample_points ≤ 80
+    # This leaves some headroom for other operations
+    # Calculate based on actual sample_points being used
+    avg_sample_points = sample_points if sample_points else 7  # Default adaptive is ~7
+    MAX_CONCURRENT_HASHES = max(10, min(80, 80 // avg_sample_points))
+
+    # Track progress across all groups
+    total_files_to_hash = sum(len(group) for group in potential_duplicates.values())
+    files_hashed = 0
+    hash_start_time = time.time()
+    last_progress_update = time.time()
+    is_tty = sys.stderr.isatty() if progress else False
+
+    # Create semaphore to limit concurrent hash operations
+    hash_semaphore = asyncio.Semaphore(MAX_CONCURRENT_HASHES)
+
+    async def hash_with_limit(entry, file_path, file_size, sample_points):
+        """Wrapper to limit concurrent hash operations."""
+        async with hash_semaphore:
+            return await compute_sample_hash(client, session, file_path, file_size, sample_points)
+
+    async with client.create_session() as session:
+        for fingerprint, group in potential_duplicates.items():
+            # Extract size from fingerprint
+            size_str = fingerprint.split(':')[0]
+            file_size = int(size_str)
+
+            # Process files in batches
+            for i in range(0, len(group), BATCH_SIZE):
+                batch = group[i:i + BATCH_SIZE]
+
+                # Compute hashes for this batch with concurrency limit
+                tasks = []
+                for entry in batch:
+                    file_path = entry['path']
+                    task = hash_with_limit(entry, file_path, file_size, sample_points)
+                    tasks.append((entry, task))
+
+                # Wait for all hashes in this batch to complete
+                results = await asyncio.gather(*[task for _, task in tasks])
+
+                # Group by hash
+                for (entry, _), sample_hash in zip(tasks, results):
+                    if sample_hash:
+                        # Create combined fingerprint: metadata + hash
+                        combined_fingerprint = f"{fingerprint}:{sample_hash}"
+                        hash_groups[combined_fingerprint].append(entry)
+
+                # Update progress
+                files_hashed += len(batch)
+
+                if progress:
+                    current_time = time.time()
+                    elapsed = current_time - hash_start_time
+                    rate = files_hashed / elapsed if elapsed > 0 else 0
+                    remaining = total_files_to_hash - files_hashed
+
+                    progress_msg = (f"[DUPLICATE DETECTION] {files_hashed:,} / {total_files_to_hash:,} hashed | "
+                                  f"{remaining:,} remaining | {rate:.1f} files/sec")
+
+                    # Only update progress display every 0.5 seconds
+                    if is_tty:
+                        # Always overwrite in TTY mode
+                        print(f"\r{progress_msg}", end='', file=sys.stderr, flush=True)
+                    elif progress.verbose and (current_time - last_progress_update) > 0.5:
+                        # Only print on new line when redirected AND enough time has passed
+                        print(progress_msg, file=sys.stderr, flush=True)
+                        last_progress_update = current_time
+
+    # Print final summary
+    if progress and is_tty:
+        elapsed = time.time() - hash_start_time
+        rate = files_hashed / elapsed if elapsed > 0 else 0
+        print(f"\r[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
+    elif progress and progress.verbose:
+        elapsed = time.time() - hash_start_time
+        rate = files_hashed / elapsed if elapsed > 0 else 0
+        print(f"[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
+
+    # Filter to only groups with 2+ files (actual duplicates)
+    duplicates = {k: v for k, v in hash_groups.items() if len(v) >= 2}
+
+    if progress and progress.verbose:
+        total_duplicates = sum(len(v) for v in duplicates.values())
+        print(f"[DUPLICATE DETECTION] Found {total_duplicates:,} confirmed duplicates in {len(duplicates):,} groups", file=sys.stderr)
+
+    return duplicates
 
 
 async def resolve_owner_filters(
@@ -4128,12 +2679,6 @@ async def main_async(args):
     print(f"Cluster:          {args.host}", file=sys.stderr)
     print(f"Path:             {args.path}", file=sys.stderr)
     print(f"JSON parser:      {JSON_PARSER_NAME}", file=sys.stderr)
-
-    # Show hash algorithm when duplicate detection is requested
-    if args.find_duplicates:
-        hash_algo = "xxHash3" if HAS_XXHASH else "BLAKE2b"
-        print(f"Hash algorithm:   {hash_algo}", file=sys.stderr)
-
     print(f"Max concurrent:   {args.max_concurrent}", file=sys.stderr)
     print(f"Connection pool:  {args.connector_limit}", file=sys.stderr)
     if args.max_depth:
@@ -4144,16 +2689,18 @@ async def main_async(args):
 
     # Load credentials
     if args.credentials_store:
-        bearer_token = get_credentials(args.credentials_store)
+        creds = get_credentials(args.credentials_store)
     else:
-        bearer_token = get_credentials(credential_store_filename())
+        creds = get_credentials(credential_store_filename())
 
-    if not bearer_token:
+    if not creds:
         print(
             "\n[ERROR] No credentials found. Please run 'qq --host <cluster> login' first.",
             file=sys.stderr,
         )
         sys.exit(1)
+
+    bearer_token = creds.bearer_token
 
     # Load persistent identity cache
     identity_cache = load_identity_cache(verbose=args.verbose)
@@ -4269,12 +2816,7 @@ async def main_async(args):
             else:
                 dirs_str = f"{int(total_dirs):,}"
 
-            # Add note if traversal filters are active
-            filter_note = ""
-            if args.max_depth or args.omit_subdirs:
-                filter_note = " (before filters)"
-
-            print(f"Searching directory {args.path} ({dirs_str} subdirectories, {files_str} files){filter_note}",
+            print(f"Searching directory {args.path} ({dirs_str} subdirectories, {files_str} files)",
                   file=sys.stderr)
         except Exception as e:
             # If aggregates fail, just continue without displaying them
@@ -4293,26 +2835,21 @@ async def main_async(args):
     if profiler:
         tree_walk_start = time.time()
 
-    # For owner reports and ACL reports, don't collect matching files to save memory
-    # Also collect results if we need to resolve symlinks or generate ACL reports
-    collect_results = not args.owner_report or args.resolve_links or args.acl_report
+    # For owner reports, don't collect matching files to save memory
+    # Also collect results if we need to resolve symlinks or find duplicates
+    collect_results = not args.owner_report or args.resolve_links or args.find_duplicates
 
     # Create output callback for streaming results to stdout (plain text mode only)
     # Disable streaming if --resolve-links is enabled (need to resolve after collection)
-    # Disable streaming if --acl-report, --find-duplicates, or --detect-duplicates is enabled (generates its own report)
     output_callback = None
     batched_handler = None
 
-    if not args.owner_report and not args.acl_report and not args.csv_out and not args.json_out and not args.resolve_links and not args.find_duplicates and not args.detect_duplicates:
-        if args.show_owner or args.show_group:
-            # Use batched output handler for streaming with identity resolution
+    if not args.owner_report and not args.csv_out and not args.json_out and not args.resolve_links and not args.find_duplicates:
+        if args.show_owner:
+            # Use batched output handler for streaming with owner resolution
             output_format = "json" if args.json else "text"
             batched_handler = BatchedOutputHandler(
-                client,
-                batch_size=100,
-                show_owner=args.show_owner,
-                show_group=args.show_group,
-                output_format=output_format,
+                client, batch_size=100, show_owner=True, output_format=output_format
             )
 
             async def output_callback(entry):
@@ -4341,7 +2878,6 @@ async def main_async(args):
             file_filter=file_filter,
             owner_stats=owner_stats,
             omit_subdirs=args.omit_subdirs,
-            omit_paths=args.omit_path,
             collect_results=collect_results,
             verbose=args.verbose,
             max_entries_per_dir=args.max_entries_per_dir,
@@ -4372,32 +2908,23 @@ async def main_async(args):
     if batched_handler:
         await batched_handler.flush()
 
-    # Resolve owner and group identities if --show-owner or --show-group is enabled (for non-streaming modes only)
+    # Resolve owner identities if --show-owner is enabled (for non-streaming modes only)
     # Skip if batched_handler was used (streaming mode)
     identity_cache_for_output = {}
-    if (args.show_owner or args.show_group) and matching_files and not batched_handler:
-        # Collect unique auth_ids (owners and/or groups) from matching files
-        unique_auth_ids = set()
+    if args.show_owner and matching_files and not batched_handler:
+        # Collect unique owner auth_ids from matching files
+        unique_owners = set()
+        for entry in matching_files:
+            owner_details = entry.get("owner_details", {})
+            owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
+            if owner_auth_id:
+                unique_owners.add(owner_auth_id)
 
-        if args.show_owner:
-            for entry in matching_files:
-                owner_details = entry.get("owner_details", {})
-                owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
-                if owner_auth_id:
-                    unique_auth_ids.add(owner_auth_id)
-
-        if args.show_group:
-            for entry in matching_files:
-                group_details = entry.get("group_details", {})
-                group_auth_id = group_details.get("auth_id") or entry.get("group")
-                if group_auth_id:
-                    unique_auth_ids.add(group_auth_id)
-
-        if unique_auth_ids:
+        if unique_owners:
             async with client.create_session() as session:
                 identity_cache_for_output = await client.resolve_multiple_identities(
                     session,
-                    list(unique_auth_ids),
+                    list(unique_owners),
                     show_progress=args.verbose or args.progress,
                 )
 
@@ -4435,399 +2962,100 @@ async def main_async(args):
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return  # Exit after report, don't output file list
 
-    # Generate duplicate detection report if requested
-    print(f"[DEBUG] args.find_duplicates={args.find_duplicates}, len(matching_files)={len(matching_files)}", file=sys.stderr, flush=True)
-    if args.find_duplicates and matching_files:
-        print(f"[DEBUG] About to call find_duplicates() with {len(matching_files)} files", file=sys.stderr, flush=True)
-        # Call find_duplicates function (creates its own session)
-        duplicate_groups = await find_duplicates(
+    # Find duplicates if requested
+    if args.find_duplicates:
+        if profiler:
+            dup_start = time.time()
+
+        print(f"\n{'=' * 70}", file=sys.stderr)
+        print(f"DUPLICATE DETECTION", file=sys.stderr)
+        print(f"{'=' * 70}", file=sys.stderr)
+
+        duplicates = await find_duplicates(
             client,
             matching_files,
             by_size_only=args.by_size,
-            sample_points_override=args.sample_points,
-            show_progress=args.progress,
-            verbose=args.verbose
+            sample_points=args.sample_points,
+            progress=progress
         )
 
-        # Output duplicate results based on format
-        if duplicate_groups:
-            if args.csv_out:
-                # CSV output: one row per duplicate set
-                import csv
+        if profiler:
+            profiler.record_sync("duplicate_detection", time.time() - dup_start)
 
-                with open(args.csv_out, 'w', newline='') as csv_file:
-                    fieldnames = ['fingerprint', 'group_size', 'total_bytes', 'file_paths']
+        # Report results
+        if not duplicates:
+            print("\nNo duplicates found.", file=sys.stderr)
+            # No duplicates, but may still need to create empty CSV
+            if args.csv_out:
+                import csv
+                with open(args.csv_out, "w", newline="") as csv_file:
+                    writer = csv.DictWriter(csv_file, fieldnames=["duplicate_group", "path", "size", "confidence"])
+                    writer.writeheader()
+                if args.verbose:
+                    print(f"\n[INFO] Created empty CSV file: {args.csv_out}", file=sys.stderr)
+        else:
+            total_groups = len(duplicates)
+            total_dupes = sum(len(group) for group in duplicates.values())
+
+            # Calculate confidence based on detection method
+            if args.by_size:
+                confidence_msg = "Detection method: Size+metadata only (may have false positives)"
+                confidence_value = "Low (size+metadata only)"
+            else:
+                # Get sample point count from first group (representative)
+                first_file = next(iter(duplicates.values()))[0]
+                file_size = int(first_file.get('size', 0))
+                sample_offsets = calculate_sample_points(file_size, args.sample_points)
+                num_points = len(sample_offsets)
+                confidence = calculate_confidence_percentage(num_points)
+                confidence_msg = f"Detection method: {num_points}-point sampling (confidence: {confidence})"
+                confidence_value = confidence
+
+            print(f"\nFound {total_dupes:,} duplicate files in {total_groups:,} groups", file=sys.stderr)
+            print(f"{confidence_msg}", file=sys.stderr)
+            print(f"{'=' * 70}\n", file=sys.stderr)
+
+            # Handle CSV output for duplicates
+            if args.csv_out:
+                import csv
+                with open(args.csv_out, "w", newline="") as csv_file:
+                    fieldnames = ["duplicate_group", "path", "size", "confidence"]
                     writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                     writer.writeheader()
 
-                    for fingerprint, files in duplicate_groups.items():
-                        total_bytes = sum(int(f.get('size', 0)) for f in files)
-                        paths = [f.get('path', '') for f in files]
-                        writer.writerow({
-                            'fingerprint': fingerprint,
-                            'group_size': len(files),
-                            'total_bytes': total_bytes,
-                            'file_paths': ' | '.join(paths)
-                        })
+                    for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                        # Extract size from fingerprint
+                        size_str = fingerprint.split(':')[0]
+                        file_size = int(size_str)
 
-                print(f"\n[INFO] Duplicate report CSV exported to: {args.csv_out}", file=sys.stderr)
+                        for f in files:
+                            writer.writerow({
+                                "duplicate_group": group_id,
+                                "path": f['path'],
+                                "size": file_size,
+                                "confidence": confidence_value
+                            })
 
-            elif args.json or args.json_out:
-                # JSON output: one object per duplicate group
-                output_handle = sys.stdout
-                if args.json_out:
-                    output_handle = open(args.json_out, 'w')
-
-                for fingerprint, files in duplicate_groups.items():
-                    total_bytes = sum(int(f.get('size', 0)) for f in files)
-                    paths = [f.get('path', '') for f in files]
-                    json_entry = {
-                        'fingerprint': fingerprint,
-                        'group_size': len(files),
-                        'total_bytes': total_bytes,
-                        'file_paths': paths
-                    }
-                    json.dump(json_entry, output_handle)
-                    output_handle.write('\n')
-
-                if args.json_out:
-                    output_handle.close()
-                    print(f"\n[INFO] Duplicate report JSON exported to: {args.json_out}", file=sys.stderr)
-
+                if args.verbose:
+                    print(f"\n[INFO] Wrote {total_dupes:,} duplicate files ({total_groups:,} groups) to {args.csv_out}", file=sys.stderr)
             else:
-                # Plain text output: grouped by duplicate set
-                print("\n" + "=" * 70)
-                print("DUPLICATE GROUPS")
-                print("=" * 70)
+                # Output duplicate groups to stdout/stderr (original behavior)
+                for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                    # Extract size from fingerprint
+                    size_str = fingerprint.split(':')[0]
+                    file_size = int(size_str)
 
-                for fingerprint, files in duplicate_groups.items():
-                    total_bytes = sum(int(f.get('size', 0)) for f in files)
-                    print(f"\nDuplicate group ({len(files)} files, {format_bytes(total_bytes)} total):")
-                    print(f"  Fingerprint: {fingerprint}")
+                    print(f"Group {group_id}: {len(files)} files ({file_size:,} bytes each)", file=sys.stderr)
                     for f in files:
-                        print(f"  {f.get('path', '')}")
+                        print(f"  {f['path']}", file=sys.stderr)
+                    print(file=sys.stderr)
 
-        # Save identity cache if used
-        if client.persistent_identity_cache:
-            save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
-
-        return  # Exit after duplicate report, don't output file list
-
-    # Generate Range-based duplicate detection report if requested
-    if args.detect_duplicates and matching_files:
-        # Call detect_duplicates function (creates its own session)
-        duplicate_groups = await detect_duplicates(
-            client,
-            matching_files,
-            show_progress=args.progress,
-            verbose=args.verbose
-        )
-
-        # Output duplicate results based on format (same format as --find-duplicates)
-        if duplicate_groups:
-            if args.csv_out:
-                # CSV output: one row per duplicate set
-                import csv
-
-                with open(args.csv_out, 'w', newline='') as csv_file:
-                    fieldnames = ['fingerprint', 'group_size', 'total_bytes', 'file_paths']
-                    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-                    writer.writeheader()
-
-                    for fingerprint, files in duplicate_groups.items():
-                        total_bytes = sum(int(f.get('size', 0)) for f in files)
-                        paths = [f.get('path', '') for f in files]
-                        writer.writerow({
-                            'fingerprint': fingerprint,
-                            'group_size': len(files),
-                            'total_bytes': total_bytes,
-                            'file_paths': ' | '.join(paths)
-                        })
-
-                print(f"\n[INFO] Duplicate report CSV exported to: {args.csv_out}", file=sys.stderr)
-
-            elif args.json or args.json_out:
-                # JSON output: one object per duplicate group
-                output_handle = sys.stdout
-                if args.json_out:
-                    output_handle = open(args.json_out, 'w')
-
-                for fingerprint, files in duplicate_groups.items():
-                    total_bytes = sum(int(f.get('size', 0)) for f in files)
-                    paths = [f.get('path', '') for f in files]
-                    json_entry = {
-                        'fingerprint': fingerprint,
-                        'group_size': len(files),
-                        'total_bytes': total_bytes,
-                        'file_paths': paths
-                    }
-                    json.dump(json_entry, output_handle)
-                    output_handle.write('\n')
-
-                if args.json_out:
-                    output_handle.close()
-                    print(f"\n[INFO] Duplicate report JSON exported to: {args.json_out}", file=sys.stderr)
-
-            else:
-                # Plain text output: grouped by duplicate set
-                print("\n" + "=" * 70)
-                print("DUPLICATE GROUPS")
-                print("=" * 70)
-
-                for fingerprint, files in duplicate_groups.items():
-                    total_bytes = sum(int(f.get('size', 0)) for f in files)
-                    print(f"\nDuplicate group ({len(files)} files, {format_bytes(total_bytes)} total):")
-                    print(f"  Fingerprint: {fingerprint}")
-                    for f in files:
-                        print(f"  {f.get('path', '')}")
-
-        # Save identity cache if used
-        if client.persistent_identity_cache:
-            save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
-
-        return  # Exit after duplicate report, don't output file list
-
-    # Generate ACL report if requested
-    if args.acl_report and matching_files:
-        print("\n" + "=" * 70, file=sys.stderr)
-        print("ACL REPORT", file=sys.stderr)
-        print("=" * 70, file=sys.stderr)
-
-        # Generate ACL report
-        async with client.create_session() as session:
-            acl_report = await generate_acl_report(
-                client,
-                session,
-                matching_files,
-                show_progress=args.progress,
-                resolve_names=args.acl_resolve_names,
-                show_owner=args.show_owner,
-                show_group=args.show_group
-            )
-
-        # Get identity cache
-        identity_cache = acl_report.get('identity_cache', {})
-
-        # Display summary statistics
-        stats = acl_report['stats']
-        print("\n" + "=" * 70, file=sys.stderr)
-        print("ACL REPORT SUMMARY", file=sys.stderr)
-        print("=" * 70, file=sys.stderr)
-        print(f"Total files analyzed:        {stats['total_files']:,}", file=sys.stderr)
-        print(f"Files with ACLs:             {stats['files_with_acls']:,}", file=sys.stderr)
-        print(f"Processing time:             {stats['processing_time']:.2f}s", file=sys.stderr)
-        if args.acl_resolve_names:
-            print(f"Identities resolved:         {len(identity_cache):,}", file=sys.stderr)
-
-        # Export to CSV if requested
-        if args.acl_csv:
-            import csv
-
-            file_acls = acl_report['file_acls']
-
-            # First pass: collect all ACL data and find max number of ACEs
-            acl_rows = []
-            max_aces = 0
-
-            for path, acl_info in file_acls.items():
-                acl_data = acl_info['acl_data']
-                is_directory = acl_info['is_directory']
-                owner_details = acl_info.get('owner_details', {})
-                group_details = acl_info.get('group_details', {})
-
-                # Skip if no ACL data
-                if not acl_data:
-                    continue
-
-                # Generate readable ACL with names if requested
-                if args.acl_resolve_names and identity_cache:
-                    readable_acl = qacl_to_readable_acl_with_names(
-                        acl_data,
-                        is_directory=is_directory,
-                        identity_cache=identity_cache
-                    )
-                else:
-                    readable_acl = qacl_to_readable_acl(acl_data, is_directory=is_directory)
-
-                # Extract ACE counts from acl_data
-                acl_dict = acl_data.get('acl', acl_data) if 'acl' in acl_data else acl_data
-                aces = acl_dict.get('aces', [])
-                ace_count = len(aces)
-                inherited_count = sum(1 for ace in aces if ace.get('flags', []) and 'INHERITED' in ace['flags'])
-                explicit_count = ace_count - inherited_count
-
-                # Split trustees
-                trustees = readable_acl.split('|') if readable_acl else []
-                max_aces = max(max_aces, len(trustees))
-
-                # Resolve owner and group names if requested
-                owner_name = None
-                group_name = None
-
-                if args.show_owner:
-                    # Use the numeric owner field as the auth_id
-                    owner_auth_id = acl_info.get('owner')
-                    if owner_auth_id and owner_auth_id in identity_cache:
-                        owner_name = format_owner_name(identity_cache[owner_auth_id])
-                    elif owner_auth_id:
-                        owner_name = f"auth_id:{owner_auth_id}"
-                    else:
-                        owner_name = "Unknown"
-
-                if args.show_group:
-                    # Use the numeric group field as the auth_id
-                    group_auth_id = acl_info.get('group')
-                    if group_auth_id and group_auth_id in identity_cache:
-                        group_name = format_owner_name(identity_cache[group_auth_id])
-                    elif group_auth_id:
-                        group_name = f"auth_id:{group_auth_id}"
-                    else:
-                        group_name = "Unknown"
-
-                acl_rows.append({
-                    'path': path,
-                    'ace_count': ace_count,
-                    'inherited_count': inherited_count,
-                    'explicit_count': explicit_count,
-                    'trustees': trustees,
-                    'owner': owner_name,
-                    'group': group_name
-                })
-
-            # Create CSV with dynamic trustee columns
-            with open(args.acl_csv, 'w', newline='') as csv_file:
-                fieldnames = ['path']
-
-                # Add owner and group columns if requested
-                if args.show_owner:
-                    fieldnames.append('owner')
-                if args.show_group:
-                    fieldnames.append('group')
-
-                # Add ACL count columns
-                fieldnames.extend([
-                    'ace_count',
-                    'inherited_count',
-                    'explicit_count'
-                ])
-
-                # Add trustee columns dynamically
-                for i in range(1, max_aces + 1):
-                    fieldnames.append(f'trustee_{i}')
-
-                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-                writer.writeheader()
-
-                # Write rows with trustees in separate columns
-                for row_data in acl_rows:
-                    row = {'path': row_data['path']}
-
-                    # Add owner and group if requested
-                    if args.show_owner:
-                        row['owner'] = row_data['owner']
-                    if args.show_group:
-                        row['group'] = row_data['group']
-
-                    # Add ACL counts
-                    row['ace_count'] = row_data['ace_count']
-                    row['inherited_count'] = row_data['inherited_count']
-                    row['explicit_count'] = row_data['explicit_count']
-
-                    # Add each trustee to its own column
-                    for i, trustee in enumerate(row_data['trustees'], start=1):
-                        row[f'trustee_{i}'] = trustee.strip()
-
-                    writer.writerow(row)
-
-            print(f"\n[INFO] ACL CSV exported to: {args.acl_csv}", file=sys.stderr)
-
-        # Export to JSON if requested
-        if args.json or args.json_out:
-            output_handle = sys.stdout
-            if args.json_out:
-                output_handle = open(args.json_out, 'w')
-
-            file_acls = acl_report['file_acls']
-
-            # Generate JSON output for ACLs - one entry per file
-            for path, acl_info in file_acls.items():
-                acl_data = acl_info['acl_data']
-                is_directory = acl_info['is_directory']
-                owner_details = acl_info.get('owner_details', {})
-                group_details = acl_info.get('group_details', {})
-
-                # Skip if no ACL data
-                if not acl_data:
-                    continue
-
-                # Generate readable ACL with names if requested
-                if args.acl_resolve_names and identity_cache:
-                    readable_acl = qacl_to_readable_acl_with_names(
-                        acl_data,
-                        is_directory=is_directory,
-                        identity_cache=identity_cache
-                    )
-                else:
-                    readable_acl = qacl_to_readable_acl(acl_data, is_directory=is_directory)
-
-                # Extract ACE counts from acl_data
-                acl_dict = acl_data.get('acl', acl_data) if 'acl' in acl_data else acl_data
-                aces = acl_dict.get('aces', [])
-                ace_count = len(aces)
-                inherited_count = sum(1 for ace in aces if ace.get('flags', []) and 'INHERITED' in ace['flags'])
-                explicit_count = ace_count - inherited_count
-
-                # Split the readable ACL by pipe to get individual ACEs
-                ace_entries = readable_acl.split('|') if readable_acl else []
-                trustees = [ace_entry.strip() for ace_entry in ace_entries]
-
-                # Write one JSON entry per file with trustees as array
-                json_entry = {'path': path}
-
-                # Add owner and group if requested
-                if args.show_owner:
-                    # Use the numeric owner field as the auth_id
-                    owner_auth_id = acl_info.get('owner')
-                    if owner_auth_id and owner_auth_id in identity_cache:
-                        json_entry['owner'] = format_owner_name(identity_cache[owner_auth_id])
-                    elif owner_auth_id:
-                        json_entry['owner'] = f"auth_id:{owner_auth_id}"
-                    else:
-                        json_entry['owner'] = "Unknown"
-
-                if args.show_group:
-                    # Use the numeric group field as the auth_id
-                    group_auth_id = acl_info.get('group')
-                    if group_auth_id and group_auth_id in identity_cache:
-                        json_entry['group'] = format_owner_name(identity_cache[group_auth_id])
-                    elif group_auth_id:
-                        json_entry['group'] = f"auth_id:{group_auth_id}"
-                    else:
-                        json_entry['group'] = "Unknown"
-
-                # Add ACL info
-                json_entry.update({
-                    'ace_count': ace_count,
-                    'inherited_count': inherited_count,
-                    'explicit_count': explicit_count,
-                    'trustees': trustees
-                })
-
-                # Use ensure_ascii=False and escape_forward_slashes=False for cleaner output
-                if JSON_PARSER_NAME == "ujson":
-                    output_handle.write(json_parser.dumps(json_entry, ensure_ascii=False, escape_forward_slashes=False) + '\n')
-                else:
-                    output_handle.write(json_parser.dumps(json_entry, ensure_ascii=False) + '\n')
-
-            if args.json_out:
-                output_handle.close()
-                print(f"\n[INFO] ACL JSON exported to: {args.json_out}", file=sys.stderr)
-
-        print("\n" + "=" * 70, file=sys.stderr)
+        if profiler:
+            profiler.print_report(elapsed)
 
         # Save identity cache before exiting
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
-        return  # Exit after ACL report
+        return  # Exit after duplicate detection
 
     # Apply limit if specified
     if args.limit and len(matching_files) > args.limit:
@@ -4869,19 +3097,6 @@ async def main_async(args):
                         else:
                             entry["owner_name"] = "Unknown"
 
-                # Add resolved group name to entries if --show-group is enabled
-                if args.show_group:
-                    for entry in matching_files:
-                        group_details = entry.get("group_details", {})
-                        group_auth_id = group_details.get("auth_id") or entry.get(
-                            "group"
-                        )
-                        if group_auth_id and group_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[group_auth_id]
-                            entry["group_name"] = format_owner_name(identity)
-                        else:
-                            entry["group_name"] = "Unknown"
-
                 # Write all attributes
                 fieldnames = sorted(matching_files[0].keys())
                 writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -4903,10 +3118,6 @@ async def main_async(args):
                 # Add owner if --show-owner is enabled
                 if args.show_owner:
                     fieldnames.append("owner")
-
-                # Add group if --show-group is enabled
-                if args.show_group:
-                    fieldnames.append("group")
 
                 # Add symlink_target if --resolve-links is enabled
                 if args.resolve_links:
@@ -4932,16 +3143,6 @@ async def main_async(args):
                             row["owner"] = format_owner_name(identity)
                         else:
                             row["owner"] = "Unknown"
-                    if args.show_group:
-                        group_details = entry.get("group_details", {})
-                        group_auth_id = group_details.get("auth_id") or entry.get(
-                            "group"
-                        )
-                        if group_auth_id and group_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[group_auth_id]
-                            row["group"] = format_owner_name(identity)
-                        else:
-                            row["group"] = "Unknown"
                     if args.resolve_links and "symlink_target" in entry:
                         row["symlink_target"] = entry["symlink_target"]
                     writer.writerow(row)
@@ -4974,19 +3175,6 @@ async def main_async(args):
                             entry["owner_name"] = format_owner_name(identity)
                         else:
                             entry["owner_name"] = "Unknown"
-
-                    # Add resolved group name to entry if --show-group is enabled
-                    if args.show_group:
-                        group_details = entry.get("group_details", {})
-                        group_auth_id = group_details.get("auth_id") or entry.get(
-                            "group"
-                        )
-                        if group_auth_id and group_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[group_auth_id]
-                            entry["group_name"] = format_owner_name(identity)
-                        else:
-                            entry["group_name"] = "Unknown"
-
                     output_handle.write(json_parser.dumps(entry) + "\n")
                 else:
                     # Minimal output: path and filtered fields
@@ -5005,16 +3193,6 @@ async def main_async(args):
                             minimal_entry["owner"] = format_owner_name(identity)
                         else:
                             minimal_entry["owner"] = "Unknown"
-                    if args.show_group:
-                        group_details = entry.get("group_details", {})
-                        group_auth_id = group_details.get("auth_id") or entry.get(
-                            "group"
-                        )
-                        if group_auth_id and group_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[group_auth_id]
-                            minimal_entry["group"] = format_owner_name(identity)
-                        else:
-                            minimal_entry["group"] = "Unknown"
                     if args.resolve_links and "symlink_target" in entry:
                         minimal_entry["symlink_target"] = entry["symlink_target"]
                     output_handle.write(json_parser.dumps(minimal_entry) + "\n")
@@ -5041,17 +3219,6 @@ async def main_async(args):
                         identity = identity_cache_for_output[owner_auth_id]
                         owner_name = format_owner_name(identity)
                         output_line = f"{output_line}\t{owner_name}"
-                    else:
-                        output_line = f"{output_line}\tUnknown"
-
-                # Add group information if --show-group is enabled
-                if args.show_group:
-                    group_details = entry.get("group_details", {})
-                    group_auth_id = group_details.get("auth_id") or entry.get("group")
-                    if group_auth_id and group_auth_id in identity_cache_for_output:
-                        identity = identity_cache_for_output[group_auth_id]
-                        group_name = format_owner_name(identity)
-                        output_line = f"{output_line}\t{group_name}"
                     else:
                         output_line = f"{output_line}\tUnknown"
 
@@ -5242,22 +3409,17 @@ Examples:
         help="Display owner information for matching files",
     )
     parser.add_argument(
-        "--show-group",
-        action="store_true",
-        help="Display group information for matching files",
-    )
-    parser.add_argument(
         "--owner-report",
         action="store_true",
         help="Generate ownership report (file count and total bytes by owner)",
     )
+
+    # Duplicate detection options
     parser.add_argument(
         "--find-duplicates",
         action="store_true",
         help="Find duplicate files using adaptive sampling strategy. "
-             "Groups files by size+datablocks, then computes sample hashes for verification. "
-             "ADVISORY ONLY: Uses content sampling (not full file hashing), which may miss small "
-             "differences in large files. Verify results before deletion.",
+             "Groups files by size+datablocks, then computes sample hashes.",
     )
     parser.add_argument(
         "--by-size",
@@ -5268,17 +3430,10 @@ Examples:
     parser.add_argument(
         "--sample-points",
         type=int,
+        choices=range(3, 12),
         metavar="N",
-        help="Override number of sample points for duplicate detection (default: adaptive 3-11 based on file size). "
-             "Requires --find-duplicates.",
-    )
-    parser.add_argument(
-        "--detect-duplicates",
-        action="store_true",
-        help="Detect duplicate files using efficient Range-based sampling. "
-             "Uses HTTP Range requests to read small windows (64 KiB) from files, combining "
-             "fixed, stratified, and random offsets for high-confidence duplicate detection "
-             "with minimal data transfer. Supports tiered escalation for stubborn matches.",
+        help="Override number of sample points for duplicate detection (3-11). "
+             "Default is adaptive based on file size.",
     )
 
     # Name search filters
@@ -5342,11 +3497,6 @@ Examples:
         help="Omit subdirectories matching pattern (supports wildcards, can be specified multiple times)",
     )
     parser.add_argument(
-        "--omit-path",
-        action="append",
-        help="Omit specific absolute paths (exact match, can be specified multiple times)",
-    )
-    parser.add_argument(
         "--max-entries-per-dir",
         type=int,
         help="Skip directories with more than N entries (safety valve for large directories)",
@@ -5355,22 +3505,6 @@ Examples:
         "--show-dir-stats",
         action="store_true",
         help="Show directory statistics without enumerating files (exploration mode)",
-    )
-
-    # ACL reporting options
-    parser.add_argument(
-        "--acl-report",
-        action="store_true",
-        help="Generate ACL inventory report showing unique ACLs and affected files",
-    )
-    parser.add_argument(
-        "--acl-csv",
-        help="Export per-file ACL data to CSV file (requires --acl-report)",
-    )
-    parser.add_argument(
-        "--acl-resolve-names",
-        action="store_true",
-        help="Resolve auth_ids and SIDs to human-readable names in ACL report (uses identity cache)",
     )
 
     # Output options
@@ -5446,31 +3580,11 @@ Examples:
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user", file=sys.stderr)
         sys.exit(130)
-    except aiohttp.ClientResponseError as e:
-        # HTTP error with detailed message
-        error_msg = format_http_error(e.status, str(e.request_info.url), args.path)
-        print(error_msg, file=sys.stderr)
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
-    except aiohttp.ClientConnectorError as e:
-        print(f"\n[ERROR] Cannot connect to cluster: {args.host}:{args.port}", file=sys.stderr)
-        print(f"[HINT] Check that the cluster is reachable and the hostname/port are correct", file=sys.stderr)
-        if args.verbose:
-            print(f"[DEBUG] {e}", file=sys.stderr)
-        sys.exit(1)
-    except aiohttp.ClientError as e:
-        print(f"\n[ERROR] Network error: {e}", file=sys.stderr)
-        print(f"[HINT] Check your network connection to the cluster", file=sys.stderr)
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
     except Exception as e:
         print(f"\n[ERROR] {e}", file=sys.stderr)
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         sys.exit(1)
 

@@ -14,3 +14,5 @@ benchmark_*
 claude_*
 __pycache__/
 test_range_*.py
+improvement_ideas.md
+DUPLICATE_DETECTION_*.md
